@@ -1,4 +1,30 @@
-**/__pycache__/*
-build/*
-dist/*
-eTraGo.egg-info/*
+# Python cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+eTraGo.egg-info/
+
+# IDE files
+.spyproject/
+etrago/.spyproject/
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+etrago/solver_etrago.log
+
+# eTraGo generated result folders
+etrago/results/
+etrago/results*/
+etrago/results-test/
+etrago/results_focus_sh/
+etrago/results_focus_sh_300/
+
+# eTraGo generated busmap/result files
+etrago/*_result.csv
+etrago/kmedoids-dijkstra_*_result.csv
+
+# Local data - do not push to GitHub
+etrago/data/

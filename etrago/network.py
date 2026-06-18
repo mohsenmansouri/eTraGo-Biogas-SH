@@ -120,6 +120,8 @@ from etrago.tools.utilities import (
     update_busmap,
 )
 
+from etrago.tools.biogas_sh import apply_biogas_sh_assets
+
 logger = logging.getLogger(__name__)
 
 __copyright__ = (
@@ -422,6 +424,8 @@ class Etrago:
     levelize_abroad_inland_parameters = levelize_abroad_inland_parameters
 
     add_simplified_distribution_grids = add_simplified_distribution_grids
+    
+    apply_biogas_sh_assets = apply_biogas_sh_assets
 
     def dc_lines(self):
         return self.filter_links_by_carrier("DC", like=False)
@@ -478,6 +482,8 @@ class Etrago:
         self.load_shedding()
 
         self.adjust_CH4_gen_carriers()
+        
+        self.apply_biogas_sh_assets()
 
         self.set_random_noise(0.01)
 

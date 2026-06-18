@@ -4344,3 +4344,145 @@ def couple_distribution_links(self, n, snapshots):
         raise ValueError(
             f"Unknown optimization method: {self.args['method']['formulation']}"
         )
+
+
+# ---------------------------------------------------------------------------
+#Biogas-SH constraints
+# ---------------------------------------------------------------------------
+
+
+def _biogas_sh_resource(self, network, snapshots):
+    """Pyomo version of the Biogas-SH annual raw-biogas constraint."""
+    import pandas as pd
+
+    arg = self.args["extra_functionality"]["biogas_sh_resource"]
+    df = pd.read_csv(arg["csv_path"])
+
+    eta_el = float(arg.get("eta_el", 0.38))
+    eta_heat = float(arg.get("eta_heat", 0.45))
+    eta_upgrade = float(arg.get("eta_upgrade", 0.96))
+    ignore_missing = bool(arg.get("ignore_missing_components", True))
+
+    n_snapshots = self.args["end_snapshot"] - self.args["start_snapshot"] + 1
+    time_fraction = n_snapshots / 8760
+
+    model = network.model
+
+    for _, row in df.iterrows():
+        plant_id = int(row["plant_id"])
+        raw_limit_mwh = float(row["raw_biogas_mwh_hs_a"]) * time_fraction
+
+        if raw_limit_mwh <= 0:
+            continue
+
+        el_gen = f"biogas_sh_el_{plant_id}"
+        heat_gen = f"biogas_sh_heat_{plant_id}"
+        ch4_gen = f"biogas_sh_ch4_{plant_id}"
+
+        available = [
+            g for g in [el_gen, heat_gen, ch4_gen] if g in network.generators.index
+        ]
+
+        if not available:
+            if ignore_missing:
+                continue
+            raise ValueError(f"No Biogas-SH generators found for plant_id={plant_id}.")
+
+        def _rule(m, el_gen=el_gen, heat_gen=heat_gen, ch4_gen=ch4_gen, raw_limit_mwh=raw_limit_mwh):
+            expr = 0
+            if el_gen in network.generators.index:
+                expr += sum(
+                    m.generator_p[el_gen, sn]
+                    * network.snapshot_weightings.generators[sn]
+                    / eta_el
+                    for sn in snapshots
+                )
+            if heat_gen in network.generators.index:
+                expr += sum(
+                    m.generator_p[heat_gen, sn]
+                    * network.snapshot_weightings.generators[sn]
+                    / eta_heat
+                    for sn in snapshots
+                )
+            if ch4_gen in network.generators.index:
+                expr += sum(
+                    m.generator_p[ch4_gen, sn]
+                    * network.snapshot_weightings.generators[sn]
+                    / eta_upgrade
+                    for sn in snapshots
+                )
+            return expr <= raw_limit_mwh
+
+        setattr(
+            model,
+            f"biogas_sh_resource_{plant_id}",
+            Constraint(rule=_rule),
+        )
+
+
+
+def _biogas_sh_resource_linopy(self, network, snapshots):
+    """Linopy version of the Biogas-SH annual raw-biogas constraint."""
+    import pandas as pd
+
+    arg = self.args["extra_functionality"]["biogas_sh_resource"]
+    df = pd.read_csv(arg["csv_path"])
+
+    eta_el = float(arg.get("eta_el", 0.38))
+    eta_heat = float(arg.get("eta_heat", 0.45))
+    eta_upgrade = float(arg.get("eta_upgrade", 0.96))
+    ignore_missing = bool(arg.get("ignore_missing_components", True))
+
+    # Same annual-scaling convention as eTraGo's CH4 annual constraints.
+    n_snapshots = self.args["end_snapshot"] - self.args["start_snapshot"] + 1
+    time_fraction = n_snapshots / 8760
+
+    weights = network.snapshot_weightings.generators.loc[snapshots]
+    gen_p = get_var(network, "Generator", "p")
+
+    for _, row in df.iterrows():
+        plant_id = int(row["plant_id"])
+        raw_limit_mwh = float(row["raw_biogas_mwh_hs_a"]) * time_fraction
+
+        if raw_limit_mwh <= 0:
+            continue
+
+        el_gen = f"biogas_sh_el_{plant_id}"
+        heat_gen = f"biogas_sh_heat_{plant_id}"
+        ch4_gen = f"biogas_sh_ch4_{plant_id}"
+
+        terms = []
+
+        if el_gen in network.generators.index:
+            terms.append(gen_p.loc[snapshots, el_gen].mul(weights, axis=0) / eta_el)
+
+        if heat_gen in network.generators.index:
+            terms.append(gen_p.loc[snapshots, heat_gen].mul(weights, axis=0) / eta_heat)
+
+        if ch4_gen in network.generators.index:
+            terms.append(gen_p.loc[snapshots, ch4_gen].mul(weights, axis=0) / eta_upgrade)
+
+        if not terms:
+            if ignore_missing:
+                continue
+            raise ValueError(f"No Biogas-SH generators found for plant_id={plant_id}.")
+
+        expr = terms[0]
+        for term in terms[1:]:
+            expr = expr + term
+
+        define_constraints(
+            network,
+            linexpr((1, expr)).sum(),
+            "<=",
+            raw_limit_mwh,
+            "Generator",
+            f"biogas_sh_resource_{plant_id}",
+        )
+
+
+
+def _biogas_sh_resource_nmp(self, network, snapshots):
+    """Fallback/non-pyomo version; mirrors the linopy-style implementation."""
+    _biogas_sh_resource_linopy(self, network, snapshots)
+

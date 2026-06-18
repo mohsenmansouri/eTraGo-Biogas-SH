@@ -46,9 +46,24 @@ if "READTHEDOCS" not in os.environ:
 
     from etrago import Etrago
 
+from pathlib import Path
+
+ETRAGO_DATA_DIR = Path("/home/dozeumam/Tools/eTraGo/eTraGo/etrago/data")
+BIOGAS_SH_DIR = ETRAGO_DATA_DIR / "biogas-sh"
+
+BIOGAS_SH_CSV = BIOGAS_SH_DIR / "biogas_sh_cluster1.csv"
+BIOGAS_SH_MAPPED_CSV = BIOGAS_SH_DIR / "biogas_sh_mapped_to_etrago_buses.csv"
+DING0_MV_GPKG = BIOGAS_SH_DIR / "ding0_mv_grid_districts.gpkg"
+
+BIOGAS_SH_FOCUS_REGION = (
+    BIOGAS_SH_DIR
+    / "focus_regions"
+    / "schleswig_holstein_focus.shp"
+)
+
 args = {
-    # Setup and Configuration:
-    "db": "oep",  # database session: oep or local database
+        # Setup and Configuration:
+    "db": "local_egon2035",  # database session: oep or local database
     "gridversion": None,  # None for model_draft or version number
     "method": {  # choose method and settings for optimization
         "type": "lopf",  # type of optimization, 'lopf' or 'sclopf'
@@ -71,7 +86,7 @@ args = {
         "q_allocation": "p_nom",  # allocate reactive power via 'p_nom' or 'p'
     },
     "start_snapshot": 1,
-    "end_snapshot": 168,
+    "end_snapshot": 10,
     "solver": "gurobi",  # glpk, cplex or gurobi
     "solver_options": {
         "BarConvTol": 1.0e-5,
@@ -88,7 +103,7 @@ args = {
     "scn_extension": None,  # None or array of extension scenarios
     # Export options:
     "lpfile": False,  # save pyomo's lp file: False or /path/to/lpfile.lp
-    "csv_export": "results",  # save results as csv: False or /path/tofolder
+    "csv_export": "results_focus_sh_300",  # save results as csv: False or /path/tofolder
     # Settings:
     "extendable": {
         "extendable_components": [
@@ -109,7 +124,15 @@ args = {
         },
     },
     "generator_noise": 789456,  # apply generator noise, False or seed number
-    "extra_functionality": {},  # Choose function name or {}
+    "extra_functionality": {
+       "biogas_sh_resource": {
+           "csv_path": str(BIOGAS_SH_CSV),
+           "eta_el": 0.38,
+           "eta_heat": 0.45,
+           "eta_upgrade": 0.96,
+           "ignore_missing_components": True,
+        },
+     },
     # Spatial Complexity:
     "network_clustering_ehv": {
         "active": False,  # choose if clustering of HV buses to EHV buses is activated
@@ -118,7 +141,7 @@ args = {
     },
     "network_clustering": {
         "method": {
-            "focus_region": None,  # None, shape-file or list with string for Kreise
+            "focus_region": str(BIOGAS_SH_FOCUS_REGION),  # None, shape-file or list with string for Kreise
             "per_country": True,  # if True, buses are restricted to one cluster per foreign country
             "algorithm": "kmedoids-dijkstra",  # choose clustering method: kmeans or kmedoids-dijkstra
             "remove_stubs": False,  # remove stubs before kmeans clustering
@@ -133,14 +156,14 @@ args = {
         "electricity_grid": {
             "active": True,  # choose if clustering is activated
             "cluster_within_focus": False,  # False for very low clustering within focus region
-            "n_clusters": 30,  # total number of resulting AC nodes
+            "n_clusters": 300,  # total number of resulting AC nodes
             "k_elec_busmap": False,  # False or path/to/busmap.csv
         },
         "gas_grids": {
             "active": True,  # choose if clustering is activated
             "cluster_within_focus": False,  #  False for very low clustering within focus region
-            "n_clusters_ch4": 15,  # total number of resulting CH4 nodes
-            "n_clusters_h2": 15,  # total number of resulting H2 nodes
+            "n_clusters_ch4": 150,  # total number of resulting CH4 nodes
+            "n_clusters_h2": 150,  # total number of resulting H2 nodes
             "k_ch4_busmap": False,  # False or path/to/ch4_busmap.csv
         },
     },
@@ -168,6 +191,64 @@ args = {
         "capacity": "osmTGmod",  # 'osmTGmod', 'tyndp2020', 'ntc_acer' or 'thermal_acer'
     },
     "comments": None,
+    
+    "biogas_sh": {
+        "active": True,
+        "csv_path": str(BIOGAS_SH_CSV),
+
+         # Main scenario choice: "swfl" or "gas_grid".
+         # In the current setup both connect to target_ch4_bus=47538;
+         # the label is kept for scenario tracking and future cost/demand variants.
+         "gas_connection_target": "gas_grid",
+
+          # Gas/SWFL connection target.
+         "target_ch4_bus": "47538",
+
+    # Use producer CH4 bus + CH4 link to target, matching eGon topology.
+    # Alternative: "direct_at_target".
+         "gas_topology": "producer_bus_link",
+         "ch4_link_p_min_pu": 0.0,
+         "ch4_link_efficiency": 1.0,
+         "ch4_link_p_nom_factor": 1.0,
+         "ch4_link_extendable": False,
+
+    # Scenario switches.
+         "add_local_generation": True,
+         "add_gas_generation": True,
+   
+    # Demand-side mapping.
+         "auto_map_demand_buses": True,
+         "mv_grid_districts_gpkg": str(DING0_MV_GPKG),
+         "mv_grid_layer": None,
+         "mv_grid_id_column": "name",
+         "mv_grid_bus_column": "name",
+         "fallback_to_neighbor_area": True,
+         "ac_load_carrier": "AC",
+         "heat_demand_carrier": "rural_heat",
+         "rural_heat_pump_carrier": "rural_heat_pump",
+
+    # Debug output: writes CSV with ac_bus_for_model and heat_bus_for_model.
+         "write_mapped_csv": str(BIOGAS_SH_MAPPED_CSV),
+         "print_skipped_components": True,
+
+    # Plant carriers.
+         "ac_only_carrier": "industrial_biomass_CHP",
+         "chp_el_carrier": "central_biomass_CHP",
+         "chp_heat_carrier": "central_biomass_CHP_heat",
+
+    # Capacities.
+         "electric_capacity_column": "hbl_95_mwel",
+         "heat_capacity_method": "annual_heat_div_8760",
+         "hours_for_heat_capacity": 8760.0,
+         "hours_for_gas_capacity": 8760.0,
+
+    # Costs.
+         "electricity_marginal_cost": 42.1,
+         "heat_marginal_cost": 0.0,
+         "default_biomethane_cost": 75.0,
+     },
+    
+
 }
 
 
@@ -476,7 +557,7 @@ def run_etrago(args, json_path):
                 Default: True.
             * "cluster_within_focus": bool
                 If False, the AC buses within the focus region will not be clustered.
-                Default: True.
+            apply_biogas_sh_assets = apply_biogas_sh_assets    Default: True.
             * "n_clusters" : int
                 Defines total number of resulting AC nodes including DE and foreign
                 nodes if `cluster_foreign_AC` is set to True, otherwise only DE
