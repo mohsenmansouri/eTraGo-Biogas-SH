@@ -28,3 +28,12 @@ etrago/kmedoids-dijkstra_*_result.csv
 
 # Local data - do not push to GitHub
 etrago/data/
+
+# Local Biogas.SH / SWFL debug outputs
+etrago/debug_*/
+etrago/scenario_debug_outputs*/
+etrago/scenario_comparison_outputs/
+etrago/notebooks/
+etrago/*.log
+etrago/*.bak*
+etrago/*.bak_*
