@@ -119,7 +119,7 @@ args = {
     },
 
     "start_snapshot": 1,
-    "end_snapshot": 24,
+    "end_snapshot": 10,
     "solver": "gurobi",  # glpk, cplex or gurobi
 
     "solver_options": {
@@ -145,7 +145,7 @@ args = {
 
     # Export options:
     "lpfile": False,  # save pyomo's lp file: False or /path/to/lpfile.lp
-    "csv_export": "debug_onsite_custom_carriers_negative_cost_24h",  # save results as csv: False or /path/tofolder
+    "csv_export": "full_eeg__hybrid_both_hp_10h_50ac_15gas_customprotected",  # save results as csv: False or /path/tofolder
 
     # Settings:
     "extendable": {
@@ -217,7 +217,21 @@ args = {
             "n_clusters_ch4": 15,  # total number of resulting CH4 nodes
             "n_clusters_h2": 15,  # total number of resulting H2 nodes
             "k_ch4_busmap": False,  # False or path/to/ch4_busmap.csv
-        },
+            # New custom protection
+            "protect_custom_ch4_buses": True,
+            "custom_ch4_buses": [
+                "47538",
+                "biogas_sh_swfl_ch4_bus",
+             ],
+             "custom_ch4_bus_prefixes": [
+                "biogas_sh_ch4_bus_",
+             ],
+             "custom_ch4_link_carriers": [
+                 "biogas_sh_swfl_direct",
+                 "biogas_sh_gas_grid_injection",
+                 "biogas_sh_swfl_grid_supply",
+             ],
+          },
     },
 
     "spatial_disaggregation": None,  # None or 'uniform'
@@ -547,8 +561,8 @@ args = {
         "scenario_mode": "custom",
 
         "add_local_generation": True,
-        "add_gas_grid_generation": False,
-        "add_swfl_direct_supply": False,
+        "add_gas_grid_generation": True,
+        "add_swfl_direct_supply": True,
 
         # Legacy field kept for compatibility. If add_gas_grid_generation is absent,
         # this is interpreted as gas-grid generation.
@@ -633,10 +647,23 @@ args = {
         "hours_for_gas_capacity": 8760.0,
 
         # Costs.
-        "electricity_marginal_cost": -10.0, #42.1,
-        "heat_marginal_cost": -10.0, #0.0,
-        "default_biomethane_cost": 25.6,  # 75.0,
-    },
+        # Raw biogas purchase price from real plant data:
+        #   7.2 ct/kWh_Hs = 72.0 €/MWh_Hs_raw
+        #
+        # Biomethane route:
+        #   96% upgrading yield is already applied in the CSV:
+        #   72.0 / 0.96 = 75.0 €/MWh_Hs_biomethane
+        #
+        # Onsite electricity route:
+        #   based on raw biogas cost and eta_el = 0.38:
+        #   No EEG:      72.0 / 0.38 = 189.5 €/MWh_el
+        #   50% EEG:     146.0 €/MWh_el
+        #   Full EEG:    102.4 €/MWh_el
+
+        "electricity_marginal_cost": 102.4,  # Full EEG case; No EEG: 189.5, 50% EEG: 146.0
+        "heat_marginal_cost": 0.0,
+        "default_biomethane_cost": 75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
+        },
 }
 
 def run_etrago(args, json_path):
@@ -1119,8 +1146,6 @@ def run_etrago(args, json_path):
         scn_name=args.get("scn_name", "eGon2035"),
     )
 
-    # DEBUG: before clustering
-    dump_biogas_sh_ch4_links("BEFORE CLUSTERING", etrago.network)
 
     # ehv network clustering
     etrago.ehv_clustering()

@@ -421,6 +421,115 @@ def sector_coupled_clustering_strategy(etrago):
     return strategy
 
 
+def _get_protected_custom_ch4_buses(etrago, network):
+    """
+    Collect custom CH4 buses that must remain singleton buses during gas clustering.
+    """
+    settings = etrago.args["network_clustering"]["gas_grids"]
+
+    protected = set(settings.get("custom_ch4_buses", []))
+
+    prefixes = tuple(settings.get("custom_ch4_bus_prefixes", []))
+    if prefixes:
+        protected.update(
+            network.buses.index[
+                network.buses.index.astype(str).str.startswith(prefixes)
+            ].astype(str)
+        )
+
+    carriers = settings.get("custom_ch4_link_carriers", [])
+    if carriers:
+        custom_links = network.links[
+            network.links["carrier"].astype(str).isin(carriers)
+        ]
+        protected.update(custom_links["bus0"].astype(str))
+        protected.update(custom_links["bus1"].astype(str))
+
+    protected = sorted(
+        b for b in protected
+        if b in network.buses.index
+        and str(network.buses.loc[b, "carrier"]) == "CH4"
+    )
+
+    return protected
+
+
+def assert_no_mixed_carrier_clusters(network, busmap, stage=""):
+    """
+    Ensure each final busmap cluster contains only one carrier.
+    """
+    busmap = busmap.copy()
+    busmap.index = busmap.index.astype(str)
+    busmap = busmap.astype(str)
+
+    buses = network.buses.copy()
+    buses.index = buses.index.astype(str)
+
+    common = busmap.index.intersection(buses.index)
+
+    df = pd.DataFrame(
+        {
+            "cluster": busmap.loc[common].astype(str),
+            "carrier": buses.loc[common, "carrier"].astype(str),
+        }
+    )
+
+    n_carriers = df.groupby("cluster")["carrier"].nunique()
+    bad_clusters = n_carriers[n_carriers > 1].index.tolist()
+
+    if bad_clusters:
+        details = df[df["cluster"].isin(bad_clusters)].sort_values(
+            ["cluster", "carrier"]
+        )
+
+        logger.error(
+            "Mixed-carrier busmap detected %s:\n%s",
+            stage,
+            details.to_string(),
+        )
+
+        raise ValueError(
+            "Mixed-carrier busmap detected before aggregation. "
+            "See log output above."
+        )
+
+
+def enforce_custom_ch4_singletons_final(etrago, network, busmap, stage=""):
+    """
+    Final safety step before PyPSA aggregation.
+
+    Protected custom CH4 buses are mapped to themselves, so they cannot collide
+    with CH4/H2 cluster IDs created earlier in gas_postprocessing().
+    """
+    settings = etrago.args["network_clustering"]["gas_grids"]
+
+    if not settings.get("protect_custom_ch4_buses", False):
+        return busmap
+
+    busmap = busmap.copy()
+    busmap.index = busmap.index.astype(str)
+    busmap = busmap.astype(str)
+
+    protected = _get_protected_custom_ch4_buses(etrago, network)
+
+    for bus in protected:
+        busmap.loc[str(bus)] = str(bus)
+
+    logger.info(
+        "Final singleton protection for %s custom CH4 buses before aggregation: %s",
+        len(protected),
+        protected,
+    )
+
+    assert_no_mixed_carrier_clusters(
+        network,
+        busmap,
+        stage=stage,
+    )
+
+    return busmap
+
+
 def gas_postprocessing(etrago, busmap, medoid_idx=None, apply_on="grid_model"):
     """
     Performs the postprocessing for the gas grid clustering based on the
@@ -482,7 +591,24 @@ def gas_postprocessing(etrago, busmap, medoid_idx=None, apply_on="grid_model"):
         network = etrago.pre_market_model
 
     if ("H2_grid" in network.buses.carrier.unique()) & (scn in ["eGon2035"]):
-        busmap = get_h2_clusters(etrago, busmap)
+         busmap.index = busmap.index.astype(str)
+
+         h2_buses = network.buses.index[
+             network.buses["carrier"].astype(str).eq("H2_grid")
+         ].astype(str)
+
+         # If run_spatial_clustering_gas already joined CH4 and H2 busmaps,
+         # do not call get_h2_clusters again.
+         h2_already_in_busmap = h2_buses.isin(busmap.index).all()
+
+         if not h2_already_in_busmap:
+             busmap = get_h2_clusters(etrago, busmap)
+         else:
+             logger.info(
+                 "H2_grid buses already present in gas busmap; skip get_h2_clusters()."
+             )
+        
+        
 
     # Add all other buses to busmap
     missing_idx = list(
@@ -530,6 +656,18 @@ def gas_postprocessing(etrago, busmap, medoid_idx=None, apply_on="grid_model"):
     busmap = busmap.astype(str)
     busmap.index = busmap.index.astype(str)
 
+    # Final safety step:
+    # gas_postprocessing may have shifted CH4/H2 cluster IDs and added
+    # sector-coupled buses. Therefore protected Biogas.SH/SWFL CH4 buses
+    # must be forced to singleton clusters here, immediately before PyPSA
+    # aggregatebuses().
+    busmap = enforce_custom_ch4_singletons_final(
+        etrago,
+        network,
+        busmap,
+        stage="final busmap before gas aggregatebuses",
+    )
+
     if apply_on == "market_model":
         aggregate_generators_carriers = []
     else:
@@ -543,6 +681,7 @@ def gas_postprocessing(etrago, busmap, medoid_idx=None, apply_on="grid_model"):
         generator_strategies=strategies_generators(),
         bus_strategies=strategies_buses(),
     )
+    
 
     if apply_on != "market_model":
         # aggregation of the links and links time series
@@ -1078,6 +1217,145 @@ def join_busmap_medoids(
     return busmap, medoid_idx
 
 
+def _numeric_cluster_ids(values):
+    ids = set()
+    for value in values:
+        try:
+            ids.add(int(value))
+        except Exception:
+            pass
+    return ids
+
+
+def assert_no_mixed_carrier_clusters(network, busmap, stage=""):
+    """
+    Debug guard: each busmap cluster must contain only one bus carrier.
+    This catches CH4/H2/AC mixing before PyPSA aggregatebuses crashes.
+    """
+    busmap = busmap.copy()
+    busmap.index = busmap.index.astype(str)
+    busmap = busmap.astype(str)
+
+    common = busmap.index.intersection(network.buses.index.astype(str))
+
+    df = pd.DataFrame(
+        {
+            "cluster": busmap.loc[common].astype(str),
+            "carrier": network.buses.loc[common, "carrier"].astype(str),
+        }
+    )
+
+    n_carriers = df.groupby("cluster")["carrier"].nunique()
+    bad_clusters = n_carriers[n_carriers > 1].index.tolist()
+
+    if bad_clusters:
+        details = df[df["cluster"].isin(bad_clusters)].sort_values(
+            ["cluster", "carrier"]
+        )
+
+        logger.error(
+            "Mixed-carrier gas busmap detected %s:\n%s",
+            stage,
+            details.to_string(),
+        )
+
+        raise ValueError(
+            "Mixed-carrier gas busmap detected before aggregation. "
+            "At least one cluster contains different bus carriers. "
+            "See log output above."
+        )
+
+
+def protect_custom_ch4_buses_from_clustering(etrago, busmap, medoid_idx=None):
+    """
+    Keep selected custom CH4 buses as singleton gas clusters.
+
+    Important:
+    This function must be called AFTER CH4 and H2 busmaps are joined.
+    Otherwise protected CH4 cluster IDs can collide with shifted H2 cluster IDs.
+    """
+    settings = etrago.args["network_clustering"]["gas_grids"]
+
+    if not settings.get("protect_custom_ch4_buses", False):
+        return busmap, medoid_idx
+
+    network = etrago.network
+
+    busmap = busmap.copy()
+    busmap.index = busmap.index.astype(str)
+    busmap = busmap.astype(str)
+
+    protected = set(settings.get("custom_ch4_buses", []))
+
+    prefixes = tuple(settings.get("custom_ch4_bus_prefixes", []))
+    if prefixes:
+        protected.update(
+            network.buses.index[
+                network.buses.index.astype(str).str.startswith(prefixes)
+            ].astype(str)
+        )
+
+    carriers = settings.get("custom_ch4_link_carriers", [])
+    if carriers:
+        custom_links = network.links[
+            network.links["carrier"].astype(str).isin(carriers)
+        ]
+        protected.update(custom_links["bus0"].astype(str))
+        protected.update(custom_links["bus1"].astype(str))
+
+    protected = sorted(
+        b for b in protected
+        if b in network.buses.index
+        and str(network.buses.loc[b, "carrier"]) == "CH4"
+    )
+
+    if not protected:
+        logger.info("No custom CH4 buses found for gas-clustering protection.")
+        return busmap, medoid_idx
+
+    used_ids = _numeric_cluster_ids(busmap.values)
+
+    if medoid_idx is not None:
+        used_ids |= _numeric_cluster_ids(medoid_idx.index)
+
+    # Use a high offset to avoid collisions with normal CH4/H2 cluster IDs.
+    next_cluster = max(used_ids) + 1000 if used_ids else 100000
+
+    if medoid_idx is not None:
+        medoid_idx = medoid_idx.copy()
+        medoid_idx.index = medoid_idx.index.astype(int)
+
+    assigned = {}
+
+    for bus in protected:
+        while next_cluster in used_ids:
+            next_cluster += 1
+
+        busmap.loc[str(bus)] = str(next_cluster)
+
+        if medoid_idx is not None:
+            medoid_idx.loc[int(next_cluster)] = str(bus)
+
+        assigned[bus] = str(next_cluster)
+        used_ids.add(next_cluster)
+        next_cluster += 1
+
+    logger.info(
+        "Protected %s custom CH4 buses from gas clustering with unique "
+        "singleton cluster IDs: %s",
+        len(protected),
+        assigned,
+    )
+
+    assert_no_mixed_carrier_clusters(
+        network,
+        busmap,
+        stage="after custom CH4 protection",
+    )
+
+    return busmap, medoid_idx
+
+
 def run_spatial_clustering_gas(self):
     """
     Performs spatial clustering on the gas network using either K-means or
@@ -1215,6 +1493,24 @@ def run_spatial_clustering_gas(self):
             else:
                 busmap = busmap_ch4
                 medoid_idx = medoid_idx_ch4
+
+            busmap, medoid_idx = protect_custom_ch4_buses_from_clustering(
+                self,
+                busmap,
+                medoid_idx,
+            )
+            
+            busmap, medoid_idx = protect_custom_ch4_buses_from_clustering(
+                self,
+                busmap,
+                medoid_idx,
+            )
+
+            assert_no_mixed_carrier_clusters(
+                self.network,
+                busmap,
+                stage="before gas_postprocessing",
+            )
 
             self.network, busmap = gas_postprocessing(self, busmap, medoid_idx)
 
