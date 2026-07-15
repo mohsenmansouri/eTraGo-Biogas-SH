@@ -54,6 +54,7 @@ from etrago.tools.import_data import (
     ensure_swfl_public_ch4_supply_link,
     fix_custom_component_scn_names,
     get_data_paths,
+    biogas_sh_csv,
 )
 
 from etrago.tools.biogas_sh import apply_biogas_sh_assets
@@ -81,7 +82,14 @@ DATA_PATHS = get_data_paths(validate=False)
 ETRAGO_DATA_DIR = DATA_PATHS.ETRAGO_DATA_DIR
 
 BIOGAS_SH_DIR = DATA_PATHS.BIOGAS_SH_DIR
-BIOGAS_SH_CSV = DATA_PATHS.BIOGAS_SH_CSV
+
+# Set to None for the default CSV.
+# Set to a filename in data/biogas-sh/ for sensitivities/debug runs.
+BIOGAS_SH_CSV_NAME = "biogas_sh_force_grid_injection_debug.csv"
+# BIOGAS_SH_CSV_NAME = None
+
+BIOGAS_SH_CSV = biogas_sh_csv(BIOGAS_SH_CSV_NAME)
+
 BIOGAS_SH_MAPPED_CSV = DATA_PATHS.BIOGAS_SH_MAPPED_CSV
 DING0_MV_GPKG = DATA_PATHS.DING0_MV_GPKG
 BIOGAS_SH_FOCUS_REGION = DATA_PATHS.BIOGAS_SH_FOCUS_REGION
@@ -119,7 +127,7 @@ args = {
     },
 
     "start_snapshot": 1,
-    "end_snapshot": 10,
+    "end_snapshot": 24,
     "solver": "gurobi",  # glpk, cplex or gurobi
 
     "solver_options": {
@@ -145,7 +153,7 @@ args = {
 
     # Export options:
     "lpfile": False,  # save pyomo's lp file: False or /path/to/lpfile.lp
-    "csv_export": "full_eeg__hybrid_both_hp_10h_50ac_15gas_customprotected",  # save results as csv: False or /path/tofolder
+    "csv_export": "biogas_sh_hybrid_24h_50ac_one_hp_test_storage",  # save results as csv: False or /path/tofolder
 
     # Settings:
     "extendable": {
@@ -276,7 +284,7 @@ args = {
         #   33935, 33543, 35906
         "area_mode": "ding0_mv_grid_districts",
 
-        # Same DING0 MV grid district file used for Biogas-SH demand mapping.
+        # Same DING0 MV grid district file usFalseed for Biogas-SH demand mapping.
         "mv_grid_districts_gpkg": str(DING0_MV_GPKG),
         "mv_grid_layer": None,
 
@@ -531,7 +539,7 @@ args = {
                     "name": "swfl_gwp_2",
 
                     # Used only when active_units is not given.
-                    "active": True,
+                    "active": False,
 
                     "heat_capacity_mw": 60.0,
                     "cop": 3.0,
@@ -547,7 +555,7 @@ args = {
 
     "biogas_sh": {
         "active": True,
-        "csv_path": str(BIOGAS_SH_CSV),
+        "csv_path": biogas_sh_csv(BIOGAS_SH_CSV_NAME),
 
         # ------------------------------------------------------------------
         # Flexible scenario routing
@@ -560,13 +568,14 @@ args = {
         #   "custom"   -> use the booleans below independently
         "scenario_mode": "custom",
 
-        "add_local_generation": True,
-        "add_gas_grid_generation": True,
-        "add_swfl_direct_supply": True,
+        "add_local_generation": True, #use Biogas.SH → supply local heat and electricty
+        "add_gas_grid_generation": True, #add Biogas.SH → public gas grid injection route.
+        "add_swfl_direct_supply": True, #add Biogas.SH → Stadtwerke Flensburg
 
         # Legacy field kept for compatibility. If add_gas_grid_generation is absent,
         # this is interpreted as gas-grid generation.
         # "add_gas_generation": True,
+        "biomethane_price_override_eur_per_mwh": 25.0, #For normal CSV-based runs: None,
 
         # Public gas grid injection route.
         "gas_connection_target": "gas_grid",
@@ -618,6 +627,54 @@ args = {
             "add_swfl_gas_load": False,
             "swfl_demand_mwh_a": 0.0,
         },
+        
+        "gas_storage": {
+            "active": True,
+
+            # One central Biogas.SH CH4 storage
+            "bus": "biogas_sh_storage_ch4_bus",
+            "store": "biogas_sh_ch4_store",
+
+            # Approximate location near SWFL / Flensburg
+            "x": 9.436502119171873,
+            "y": 54.79233181101448,
+
+            # Storage energy capacity [MWh_gas]
+            "e_nom_mwh": 500.0,
+            "e_nom_extendable": False,
+            "e_nom_min": 0.0,
+
+            # Storage operation
+            "e_initial": 0.0,
+            "e_cyclic": True,
+            "standing_loss": 0.0,
+            "marginal_cost": 0.0,
+            "capital_cost": 0.0,
+
+            # Storage -> public CH4 grid
+            "grid_link": "biogas_sh_storage_to_grid_47538",
+            "grid_link_carrier": "biogas_sh_storage_to_grid",
+            "grid_link_p_nom_mw": 50.0,
+            "grid_link_extendable": False,
+            "grid_link_p_nom_min": 0.0,
+            "grid_link_p_min_pu": 0.0,
+            "grid_link_p_max_pu": 1.0,
+            "grid_link_efficiency": 1.0,
+            "grid_link_marginal_cost": 0.0,
+            "grid_link_capital_cost": 0.0,
+            
+            # Storage -> SWFL CH4 bus
+            "swfl_link": "biogas_sh_storage_to_swfl",
+            "swfl_link_carrier": "biogas_sh_storage_to_swfl",
+            "swfl_link_p_nom_mw": 50.0,
+            "swfl_link_extendable": False,
+            "swfl_link_p_nom_min": 0.0,
+            "swfl_link_p_min_pu": 0.0,
+            "swfl_link_p_max_pu": 1.0,
+            "swfl_link_efficiency": 1.0,
+            "swfl_link_marginal_cost": 0.0,
+            "swfl_link_capital_cost": 0.0,
+        },  
 
         # ------------------------------------------------------------------
         # Demand-side mapping
@@ -662,7 +719,7 @@ args = {
 
         "electricity_marginal_cost": 102.4,  # Full EEG case; No EEG: 189.5, 50% EEG: 146.0
         "heat_marginal_cost": 0.0,
-        "default_biomethane_cost": 75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
+        "default_biomethane_cost": -10.0, #75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
         },
 }
 

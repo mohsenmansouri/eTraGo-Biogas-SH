@@ -1086,6 +1086,144 @@ def _add_swfl_direct_link_from_plant(network, plant_id: int, plant_bus: str, swf
         capital_cost=float(swfl_cfg.get("direct_link_capital_cost", 0.0)),
     )
 
+
+def _biogas_sh_storage_settings(settings) -> dict:
+    """Read optional Biogas.SH gas-storage settings."""
+    cfg = settings.get("gas_storage", {})
+    if cfg is None:
+        return {}
+    if not isinstance(cfg, dict):
+        raise TypeError("biogas_sh.gas_storage must be a dictionary.")
+    return cfg
+
+
+def _ensure_biogas_sh_single_storage(network, settings) -> tuple[str, bool]:
+    """
+    Add one central Biogas.SH CH4 storage.
+
+    Topology:
+        Biogas.SH plant CH4 buses
+              -> biogas_sh_storage_ch4_bus
+              <-> biogas_sh_ch4_store
+              -> SWFL CH4 bus
+              -> public CH4 grid
+    """
+    cfg = _biogas_sh_storage_settings(settings)
+
+    if not _as_bool(cfg.get("active", False), False):
+        return None, False
+
+    storage_bus = str(cfg.get("bus", "biogas_sh_storage_ch4_bus"))
+    storage_name = str(cfg.get("store", "biogas_sh_ch4_store"))
+
+    # approximate location near Flensburg / SWFL
+    x = float(cfg.get("x", 9.436502119171873))
+    y = float(cfg.get("y", 54.79233181101448))
+
+    if storage_bus not in network.buses.index:
+        network.add(
+            "Bus",
+            storage_bus,
+            carrier="CH4",
+            x=x,
+            y=y,
+        )
+
+    _remove_component_if_exists(network, "Store", storage_name)
+
+    network.add(
+        "Store",
+        storage_name,
+        bus=storage_bus,
+        carrier="CH4",
+        e_nom=float(cfg.get("e_nom_mwh", 500.0)),
+        e_nom_extendable=_as_bool(cfg.get("e_nom_extendable", False), False),
+        e_nom_min=float(cfg.get("e_nom_min", 0.0)),
+        e_initial=float(cfg.get("e_initial", 0.0)),
+        e_cyclic=_as_bool(cfg.get("e_cyclic", True), True),
+        standing_loss=float(cfg.get("standing_loss", 0.0)),
+        marginal_cost=float(cfg.get("marginal_cost", 0.0)),
+        capital_cost=float(cfg.get("capital_cost", 0.0)),
+    )
+
+    return storage_bus, True
+
+
+def _add_biogas_sh_storage_output_links(
+    network,
+    storage_bus: str,
+    settings,
+    add_gas_grid_generation: bool,
+    add_swfl_direct_supply: bool,
+    target_ch4_bus: str = None,
+    swfl_bus: str = None,
+) -> None:
+    """
+    Add output links from the single Biogas.SH storage bus to:
+    1) public CH4 grid
+    2) SWFL CH4 bus
+    """
+    cfg = _biogas_sh_storage_settings(settings)
+
+    if add_gas_grid_generation:
+        if target_ch4_bus is None:
+            raise ValueError("target_ch4_bus is required for storage-to-grid link.")
+
+        grid_link = str(
+            cfg.get(
+                "grid_link",
+                f"biogas_sh_storage_to_grid_{target_ch4_bus}",
+            )
+        )
+
+        _remove_component_if_exists(network, "Link", grid_link)
+
+        network.add(
+            "Link",
+            grid_link,
+            bus0=storage_bus,
+            bus1=target_ch4_bus,
+            carrier=str(cfg.get("grid_link_carrier", "biogas_sh_storage_to_grid")),
+            p_nom=float(cfg.get("grid_link_p_nom_mw", 50.0)),
+            p_nom_extendable=_as_bool(cfg.get("grid_link_extendable", False), False),
+            p_nom_min=float(cfg.get("grid_link_p_nom_min", 0.0)),
+            p_min_pu=float(cfg.get("grid_link_p_min_pu", 0.0)),
+            p_max_pu=float(cfg.get("grid_link_p_max_pu", 1.0)),
+            efficiency=float(cfg.get("grid_link_efficiency", 1.0)),
+            marginal_cost=float(cfg.get("grid_link_marginal_cost", 0.0)),
+            capital_cost=float(cfg.get("grid_link_capital_cost", 0.0)),
+        )
+
+    if add_swfl_direct_supply:
+        if swfl_bus is None:
+            raise ValueError("swfl_bus is required for storage-to-SWFL link.")
+
+        swfl_link = str(
+            cfg.get(
+                "swfl_link",
+                f"biogas_sh_storage_to_swfl_{swfl_bus}",
+            )
+        )
+
+        _remove_component_if_exists(network, "Link", swfl_link)
+
+        network.add(
+            "Link",
+            swfl_link,
+            bus0=storage_bus,
+            bus1=swfl_bus,
+            carrier=str(cfg.get("swfl_link_carrier", "biogas_sh_storage_to_swfl")),
+            p_nom=float(cfg.get("swfl_link_p_nom_mw", 50.0)),
+            p_nom_extendable=_as_bool(cfg.get("swfl_link_extendable", False), False),
+            p_nom_min=float(cfg.get("swfl_link_p_nom_min", 0.0)),
+            p_min_pu=float(cfg.get("swfl_link_p_min_pu", 0.0)),
+            p_max_pu=float(cfg.get("swfl_link_p_max_pu", 1.0)),
+            efficiency=float(cfg.get("swfl_link_efficiency", 1.0)),
+            marginal_cost=float(cfg.get("swfl_link_marginal_cost", 0.0)),
+            capital_cost=float(cfg.get("swfl_link_capital_cost", 0.0)),
+        )
+
+
 # =============================================================================
 # Public function attached to Etrago in network.py
 # =============================================================================
@@ -1171,6 +1309,8 @@ def apply_biogas_sh_assets(self) -> None:
         ch4_link_carrier,
         "biogas_sh_swfl_direct",
         "biogas_sh_swfl_grid_supply",
+        "biogas_sh_storage_to_grid",
+        "biogas_sh_storage_to_swfl",
     ]
 
     for carrier in required_carriers:
@@ -1182,6 +1322,19 @@ def apply_biogas_sh_assets(self) -> None:
     el_mc = float(settings.get("electricity_marginal_cost", 42.1))
     heat_mc = float(settings.get("heat_marginal_cost", 0.0))
     default_biomethane_cost = float(settings.get("default_biomethane_cost", 75.0))
+
+    # Optional override from appl.py.
+    # If None: use plant-specific CSV value.
+    # If number: use this value for all Biogas.SH CH4_biogas generators.
+    biomethane_price_override = settings.get(
+        "biomethane_price_override_eur_per_mwh",
+        None,
+    )
+
+    if biomethane_price_override is not None and not _is_missing(biomethane_price_override):
+        biomethane_price_override = float(biomethane_price_override)
+    else:
+        biomethane_price_override = None
 
     target_ch4_bus = _clean_id(settings.get("target_ch4_bus", "47538"))
     gas_topology = str(settings.get("gas_topology", "producer_bus_link")).strip().lower()
@@ -1215,6 +1368,32 @@ def apply_biogas_sh_assets(self) -> None:
             swfl_redirected_links,
             swfl_grid_supply_added,
         ) = _ensure_swfl_ch4_bus_and_access(network, settings)
+        
+        
+    # -------------------------------------------------------------------------
+    # Optional single Biogas.SH CH4 storage
+    # -------------------------------------------------------------------------
+    storage_cfg = _biogas_sh_storage_settings(settings)
+    use_biogas_sh_storage = _as_bool(storage_cfg.get("active", False), False)
+
+    storage_bus = None
+    storage_added = False
+
+    if use_biogas_sh_storage:
+        storage_bus, storage_added = _ensure_biogas_sh_single_storage(
+            network=network,
+            settings=settings,
+        )
+
+        _add_biogas_sh_storage_output_links(
+            network=network,
+            storage_bus=storage_bus,
+            settings=settings,
+            add_gas_grid_generation=add_gas_grid_generation,
+            add_swfl_direct_supply=add_swfl_direct_supply,
+            target_ch4_bus=target_ch4_bus,
+            swfl_bus=swfl_bus,
+        )
 
     # -------------------------------------------------------------------------
     # 6. Counters and debug bookkeeping
@@ -1331,26 +1510,34 @@ def apply_biogas_sh_assets(self) -> None:
         # ---------------------------------------------------------------------
         # 7b. Gas-grid and/or SWFL-direct CH4 route
         # ---------------------------------------------------------------------
+        
+        # ---------------------------------------------------------------------
+        # 7b. Gas-grid and/or SWFL-direct CH4 route
+        # ---------------------------------------------------------------------
         if add_gas_grid_generation or add_swfl_direct_supply:
             p_nom_ch4 = _get_ch4_p_nom(row, settings)
             potential_ch4_capacity += float(max(p_nom_ch4, 0.0))
 
-            biomethane_cost = _safe_float(
-                row,
-                "biomethane_price_eur_per_mwh_hs_at_96pct",
-                default=default_biomethane_cost,
-            )
+            if biomethane_price_override is not None:
+                biomethane_cost = biomethane_price_override
+            else:
+                biomethane_cost = _safe_float(
+                    row,
+                    "biomethane_price_eur_per_mwh_hs_at_96pct",
+                    default=default_biomethane_cost,
+                )
 
             if p_nom_ch4 <= 0:
                 debug_local["ch4_p_nom_zero"] += 1
                 skipped.append((plant_id, plant_name, "ch4_p_nom_zero", p_nom_ch4))
                 continue
 
-            # Simpler topology: generator directly at the public target CH4 bus
+            # Direct-at-target topology should only be used when no Biogas.SH storage is active
             if (
                 add_gas_grid_generation
                 and not add_swfl_direct_supply
                 and gas_topology == "direct_at_target"
+                and not use_biogas_sh_storage
             ):
                 _add_ch4_generator_direct(
                     network=network,
@@ -1362,8 +1549,8 @@ def apply_biogas_sh_assets(self) -> None:
                 added_ch4 += 1
                 added_ch4_capacity += float(p_nom_ch4)
                 continue
-
-            # Recommended topology: plant-specific CH4 bus + generator + links
+            
+            # Plant-specific CH4 bus + CH4_biogas generator
             plant_bus, _ = _ensure_plant_ch4_bus_and_generator(
                 network=network,
                 row=row,
@@ -1374,6 +1561,30 @@ def apply_biogas_sh_assets(self) -> None:
             added_ch4 += 1
             added_ch4_capacity += float(p_nom_ch4)
 
+        if use_biogas_sh_storage:
+            # New topology:
+            # plant CH4 bus -> one central Biogas.SH storage bus
+            #
+            # Downstream routes are already added once above:
+            # storage bus -> SWFL
+            # storage bus -> public CH4 grid
+            _add_ch4_grid_link_from_plant(
+                network=network,
+                plant_id=plant_id,
+                plant_bus=plant_bus,
+                target_ch4_bus=storage_bus,
+                p_nom=p_nom_ch4,
+                settings=settings,
+            )
+
+            added_grid_links += 1
+            added_grid_link_capacity += float(
+            p_nom_ch4 * float(settings.get("ch4_link_p_nom_factor", 1.0))
+            )
+
+        else:
+            # Original topology:
+            # plant CH4 bus -> public CH4 grid
             if add_gas_grid_generation:
                 _add_ch4_grid_link_from_plant(
                     network=network,
@@ -1388,6 +1599,8 @@ def apply_biogas_sh_assets(self) -> None:
                     p_nom_ch4 * float(settings.get("ch4_link_p_nom_factor", 1.0))
                 )
 
+            # Original topology:
+            # plant CH4 bus -> SWFL CH4 bus
             if add_swfl_direct_supply:
                 swfl_cfg = _swfl_direct_settings(settings)
                 _add_swfl_direct_link_from_plant(
@@ -1402,7 +1615,8 @@ def apply_biogas_sh_assets(self) -> None:
                 added_swfl_link_capacity += float(
                     p_nom_ch4 * float(swfl_cfg.get("direct_link_p_nom_factor", 1.0))
                 )
-
+        
+        
     # -------------------------------------------------------------------------
     # 8. Summary output
     # -------------------------------------------------------------------------
@@ -1413,6 +1627,11 @@ def apply_biogas_sh_assets(self) -> None:
     print(f"  SWFL direct supply:         {add_swfl_direct_supply}")
     print(f"  gas_topology:               {gas_topology}")
     print(f"  target_ch4_bus:             {target_ch4_bus}")
+    
+    if biomethane_price_override is not None:
+        print(f"  biomethane price override:  {biomethane_price_override:.2f} €/MWh_Hs")
+    else:
+        print("  biomethane price source:    CSV plant-specific values")
 
     print(f"  onsite AC-only carrier:     {ac_only_carrier}")
     print(f"  onsite CHP-el carrier:      {chp_el_carrier}")
@@ -1440,6 +1659,12 @@ def apply_biogas_sh_assets(self) -> None:
     print(f"  potential el capacity MW:   {potential_el_capacity:.6f}")
     print(f"  potential heat capacity MW: {potential_heat_capacity:.6f}")
     print(f"  potential CH4 capacity MW:  {potential_ch4_capacity:.6f}")
+    
+    print(f"  Biogas.SH storage active:   {use_biogas_sh_storage}")
+    if use_biogas_sh_storage:
+        print(f"  Biogas.SH storage bus:      {storage_bus}")
+        print(f"  Biogas.SH storage added:    {storage_added}")
+    
 
     print(f"  skipped components:         {len(skipped)}")
 

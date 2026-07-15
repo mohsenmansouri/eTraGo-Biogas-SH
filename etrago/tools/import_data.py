@@ -188,6 +188,36 @@ def get_data_paths(validate: bool = False) -> EtragoInputPaths:
     return paths
 
 
+
+
+def biogas_sh_csv(filename=None):
+    """
+    Resolve Biogas.SH CSV files flexibly.
+
+    Examples
+    --------
+    biogas_sh_csv()
+        -> default Biogas.SH CSV from get_data_paths()
+
+    biogas_sh_csv("biogas_sh_force_grid_injection_debug.csv")
+        -> BIOGAS_SH_DIR / this filename
+
+    biogas_sh_csv("/absolute/path/to/file.csv")
+        -> absolute path directly
+    """
+    paths = get_data_paths(validate=False)
+
+    if filename is None or str(filename).strip() == "":
+        return str(paths.BIOGAS_SH_CSV)
+
+    p = Path(filename).expanduser()
+
+    if p.is_absolute():
+        return str(p)
+
+    return str(paths.BIOGAS_SH_DIR / p)
+
+
 def validate_required_paths(
     paths: EtragoInputPaths,
     required: Optional[Iterable[str]] = None,
