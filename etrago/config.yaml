@@ -1,0 +1,337 @@
+# =============================================================================
+# Biogas.SH / SWFL scenario configuration
+# =============================================================================
+# Version 2 matches the current storage-aware Biogas.SH model and the detailed
+# SWFL unit representation.
+#
+# In normal use, edit only the "selection" section and, when needed, "run".
+# =============================================================================
+
+version: 2
+
+project:
+  name: "Biogas.SH–SWFL"
+  description: "Storage-aware Biogas.SH and detailed Stadtwerke Flensburg scenarios"
+
+# -----------------------------------------------------------------------------
+# USER CONTROLS
+# -----------------------------------------------------------------------------
+selection:
+  natural_gas_price_case: "upstream_only"
+  biomethane_price_case: "low_25"
+  heat_pump_case: "two"
+  swfl_unit_case: "all_operational"
+  biomethane_use_case: "k12_k13_only"
+  biogas_route_case: "hybrid"
+
+# Null means: preserve the corresponding value already defined in appl.py.
+run:
+  start_snapshot: null
+  end_snapshot: null
+  ac_clusters: null
+  result_name_template: "{scenario}_{hours}h_{ac_clusters}ac"
+
+# -----------------------------------------------------------------------------
+# PRICE CASES
+# -----------------------------------------------------------------------------
+# The natural-gas value is an ADDER on the public-grid -> SWFL supply Link.
+# Keep "upstream_only" when the public CH4 grid already carries the commodity
+# cost, otherwise the gas price may be counted twice.
+price_cases:
+  natural_gas:
+    upstream_only:
+      description: "Use upstream public-grid gas cost; no additional SWFL adder."
+      swfl_import_adder_eur_per_mwh_hs: 0.0
+
+    adder_25:
+      description: "Add 25 EUR/MWh_Hs to public-grid gas entering SWFL."
+      swfl_import_adder_eur_per_mwh_hs: 25.0
+
+    adder_50:
+      description: "Add 50 EUR/MWh_Hs to public-grid gas entering SWFL."
+      swfl_import_adder_eur_per_mwh_hs: 50.0
+
+    adder_75:
+      description: "Add 75 EUR/MWh_Hs to public-grid gas entering SWFL."
+      swfl_import_adder_eur_per_mwh_hs: 75.0
+
+  biomethane:
+    low_25:
+      description: "Low-cost/support-style biomethane assumption."
+      marginal_cost_eur_per_mwh_hs: 25.0
+
+    medium_50:
+      description: "Intermediate biomethane cost."
+      marginal_cost_eur_per_mwh_hs: 50.0
+
+    cost_based_75:
+      description: "Cost-based biomethane assumption."
+      marginal_cost_eur_per_mwh_hs: 75.0
+
+  onsite:
+    electricity_marginal_cost_eur_per_mwh:
+      full_eeg: 102.4
+      half_eeg: 146.0
+      no_eeg: 189.5
+    selected_electricity_case: "full_eeg"
+    heat_marginal_cost_eur_per_mwh: 0.0
+
+# -----------------------------------------------------------------------------
+# HEAT-PUMP CASES
+# -----------------------------------------------------------------------------
+heat_pump_cases:
+  none:
+    description: "Remove the legacy eGon SWFL heat pump and add no planned GWP."
+    active_units: []
+
+  one_gwp1:
+    description: "Use only GWP 1."
+    active_units:
+      - "swfl_gwp_1"
+
+  one_gwp2:
+    description: "Use only GWP 2."
+    active_units:
+      - "swfl_gwp_2"
+
+  two:
+    description: "Use GWP 1 and GWP 2."
+    active_units:
+      - "swfl_gwp_1"
+      - "swfl_gwp_2"
+
+# -----------------------------------------------------------------------------
+# SWFL UNIT-AVAILABILITY CASES
+# -----------------------------------------------------------------------------
+# Heat pumps are controlled independently above.
+swfl_unit_cases:
+  all_operational:
+    description: "Gas-to-power, K5/K11/K12/K13, EHK1 and EHK2."
+    central_gas_to_power: true
+    boilers:
+      - "swfl_real_k5"
+      - "swfl_real_k11"
+      - "swfl_real_k12"
+      - "swfl_real_k13"
+    resistive_heaters:
+      - "swfl_real_ehk1"
+      - "swfl_real_ehk2"
+    reserve_gas_boiler: false
+
+  gas_units_only:
+    description: "Gas-to-power and all four boilers; no resistive heaters."
+    central_gas_to_power: true
+    boilers:
+      - "swfl_real_k5"
+      - "swfl_real_k11"
+      - "swfl_real_k12"
+      - "swfl_real_k13"
+    resistive_heaters: []
+    reserve_gas_boiler: false
+
+  k12_k13_plus_gas_to_power:
+    description: "Gas-to-power plus K12 and K13."
+    central_gas_to_power: true
+    boilers:
+      - "swfl_real_k12"
+      - "swfl_real_k13"
+    resistive_heaters: []
+    reserve_gas_boiler: false
+
+  k12_k13_only:
+    description: "K12 and K13 only."
+    central_gas_to_power: false
+    boilers:
+      - "swfl_real_k12"
+      - "swfl_real_k13"
+    resistive_heaters: []
+    reserve_gas_boiler: false
+
+  electric_heat_only:
+    description: "EHK1 and EHK2 only; planned heat pumps remain independent."
+    central_gas_to_power: false
+    boilers: []
+    resistive_heaters:
+      - "swfl_real_ehk1"
+      - "swfl_real_ehk2"
+    reserve_gas_boiler: false
+
+# -----------------------------------------------------------------------------
+# BIOMETHANE ELIGIBILITY AT SWFL
+# -----------------------------------------------------------------------------
+biomethane_use_cases:
+  "off":
+    mode: "off"
+    eligible_units: []
+
+  k12_k13_only:
+    mode: "custom"
+    eligible_units:
+      - "swfl_real_k12"
+      - "swfl_real_k13"
+
+  all_gas_units:
+    mode: "custom"
+    eligible_units:
+      - "swfl_real_k5"
+      - "swfl_real_k11"
+      - "swfl_real_k12"
+      - "swfl_real_k13"
+
+# -----------------------------------------------------------------------------
+# BIOGAS.SH ROUTE CASES
+# -----------------------------------------------------------------------------
+# The internal booleans retain their existing names for compatibility:
+#   add_gas_grid_generation -> plant buses -> storage -> public CH4 grid
+#   add_swfl_direct_supply  -> plant buses -> storage -> SWFL biomethane bus
+biogas_route_cases:
+  onsite:
+    description: "Use only onsite electricity/heat options."
+    add_local_generation: true
+    add_gas_grid_generation: false
+    add_swfl_direct_supply: false
+
+  storage_to_grid:
+    description: "Route biomethane through central storage to the public CH4 grid."
+    add_local_generation: false
+    add_gas_grid_generation: true
+    add_swfl_direct_supply: false
+
+  storage_to_swfl:
+    description: "Route biomethane through central storage to the SWFL biomethane bus."
+    add_local_generation: false
+    add_gas_grid_generation: false
+    add_swfl_direct_supply: true
+
+  hybrid:
+    description: "Enable onsite options and both central-storage output routes."
+    add_local_generation: true
+    add_gas_grid_generation: true
+    add_swfl_direct_supply: true
+
+# -----------------------------------------------------------------------------
+# TECHNICAL ASSUMPTIONS
+# -----------------------------------------------------------------------------
+technical:
+  swfl:
+    buses:
+      ac: "33935"
+      heat: "swfl_real_central_heat_bus"
+      natural_gas: "biogas_sh_swfl_ch4_bus"
+      biomethane: "swfl_real_biomethane_ch4_bus"
+      public_ch4: "47538"
+
+    selected_mv_grid_district_ids:
+      - "33935"
+      - "33543"
+      - "35906"
+
+    loads:
+      # Null preserves the path already configured in appl.py.
+      heat_csv_path: null
+      heat_year: 2023
+      heat_datetime_column: "timestamp"
+      heat_column: "hkw_heat_mw"
+      ac_target_annual_demand_mwh: 381516.0
+
+    central_gas_to_power:
+      electric_capacity_mw: 241.0
+      electric_efficiency: 0.40
+      marginal_cost_eur_per_mwh: 0.0
+
+    boilers:
+      swfl_real_k5:
+        heat_capacity_mw: 60.0
+        efficiency: 0.90
+      swfl_real_k11:
+        heat_capacity_mw: 70.0
+        efficiency: 0.90
+      swfl_real_k12:
+        heat_capacity_mw: 80.0
+        efficiency: 0.90
+      swfl_real_k13:
+        heat_capacity_mw: 90.0
+        efficiency: 0.90
+
+    resistive_heaters:
+      swfl_real_ehk1:
+        heat_capacity_mw: 30.0
+        efficiency: 0.99
+      swfl_real_ehk2:
+        heat_capacity_mw: 40.0
+        efficiency: 0.99
+
+    heat_pumps:
+      swfl_gwp_1:
+        heat_capacity_mw: 60.0
+        cop: 3.0
+        planned_year: 2028
+      swfl_gwp_2:
+        heat_capacity_mw: 60.0
+        cop: 3.0
+        planned_year: null
+
+    reserve_gas_boiler:
+      heat_capacity_mw: 203.0
+      efficiency: 1.0
+
+  biogas_sh:
+    efficiencies:
+      onsite_electricity: 0.38
+      onsite_heat: 0.45
+      upgrading: 0.96
+
+    resource_constraint:
+      active: true
+      ignore_missing_components: false
+
+    public_grid_to_swfl:
+      power_capacity_mw: 1500.0
+      efficiency: 1.0
+      capital_cost_eur_per_mw: 0.0
+
+    storage:
+      active: true
+      energy_capacity_mwh: 500.0
+      initial_energy_mwh: 0.0
+      cyclic: true
+      standing_loss: 0.0
+
+      plant_to_storage:
+        efficiency: 1.0
+        marginal_cost_eur_per_mwh: 0.0
+
+      storage_to_public_grid:
+        power_capacity_mw: 50.0
+        efficiency: 1.0
+        marginal_cost_eur_per_mwh: 0.0
+
+      storage_to_swfl:
+        power_capacity_mw: 50.0
+        efficiency: 1.0
+        marginal_cost_eur_per_mwh: 0.0
+
+# -----------------------------------------------------------------------------
+# OPTIONAL FACTORIAL SENSITIVITY MATRIX
+# -----------------------------------------------------------------------------
+scenario_matrix:
+  enabled: true
+  dimensions:
+    natural_gas_price_case:
+      - "upstream_only"
+      - "adder_25"
+      - "adder_50"
+    biomethane_price_case:
+      - "low_25"
+      - "medium_50"
+      - "cost_based_75"
+    heat_pump_case:
+      - "one_gwp1"
+      - "two"
+    swfl_unit_case:
+      - "all_operational"
+      - "k12_k13_plus_gas_to_power"
+    biomethane_use_case:
+      - "k12_k13_only"
+    biogas_route_case:
+      - "hybrid"

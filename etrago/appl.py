@@ -29,6 +29,14 @@ import datetime
 import os
 import os.path
 
+from pathlib import Path
+
+from scenario_config import (
+    load_and_apply_config,
+    scenario_summary,
+    write_resolved_config,
+)
+
 __copyright__ = (
     "Flensburg University of Applied Sciences, "
     "Europa-Universität Flensburg, Centre for Sustainable Energy Systems, "
@@ -1374,6 +1382,21 @@ def run_etrago(args, json_path):
         <https://www.pypsa.org/doc/components.html#network>`_
 
     """
+    config_path = Path(__file__).with_name(
+        "config.yaml"
+    )
+
+    args, resolved_scenario = load_and_apply_config(
+        args,
+        config_path,
+    )
+
+    print(
+        scenario_summary(
+            resolved_scenario
+        )
+    )
+
     etrago = Etrago(args, json_path=json_path)
 
     # import network from database
@@ -1412,10 +1435,16 @@ def run_etrago(args, json_path):
     etrago.spatial_clustering()
 
     # Defensive post-clustering cleanup.
-    purge_legacy_swfl_heat_pumps(
-        etrago.network,
-        stage="after spatial clustering",
+    future_hp_cfg = (
+        args.get("swfl_real_system", {})
+        .get("future_heat_pumps", {})
     )
+
+    if future_hp_cfg.get("active", False):
+        purge_legacy_swfl_heat_pumps(
+            etrago.network,
+            stage="after spatial clustering",
+        )
 
 
     etrago.spatial_clustering_gas()
@@ -1452,6 +1481,17 @@ def run_etrago(args, json_path):
 
     # calculate central etrago results
     etrago.calc_results()
+
+    result_directory = args.get(
+    "csv_export"
+    )
+
+    if result_directory:
+        write_resolved_config(
+            resolved_scenario,
+            Path(result_directory)
+            / "resolved_config.yaml",
+        )
 
     return etrago
 
