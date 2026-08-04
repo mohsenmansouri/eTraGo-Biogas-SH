@@ -482,8 +482,6 @@ class Etrago:
         self.load_shedding()
 
         self.adjust_CH4_gen_carriers()
-        
-        self.apply_biogas_sh_assets()
 
         self.set_random_noise(0.01)
 

@@ -46,20 +46,28 @@ if "READTHEDOCS" not in os.environ:
     # Do not import internal packages directly.
     from etrago import Etrago
 
-    from etrago.tools.swfl_real_system import apply_swfl_real_system
+    from etrago.tools.swfl_real_system import (
+        apply_swfl_real_system,
+        purge_legacy_swfl_heat_pumps,
+        remove_known_legacy_swfl_heat_pump_before_clustering,
+    )
+
+    from etrago.tools.biogas_sh import (
+        apply_biogas_sh_assets,
+        validate_biogas_sh_storage_topology,
+    )
 
 from etrago.tools.import_data import (
-    diagnose_swfl_market_balance,
-    ensure_swfl_ch4_import_generator,
-    ensure_swfl_public_ch4_supply_link,
+    biogas_sh_csv,
     fix_custom_component_scn_names,
     get_data_paths,
-    biogas_sh_csv,
 )
 
-from etrago.tools.biogas_sh import apply_biogas_sh_assets
 
 import warnings
+import logging
+
+logger = logging.getLogger(__name__)
 
 warnings.filterwarnings(
     "ignore",
@@ -153,7 +161,7 @@ args = {
 
     # Export options:
     "lpfile": False,  # save pyomo's lp file: False or /path/to/lpfile.lp
-    "csv_export": "biogas_sh_hybrid_24h_50ac_one_hp_test_storage",  # save results as csv: False or /path/tofolder
+    "csv_export": "biogas_sh_hybrid_24h_50ac_two_hp_test_advanced_swfl_removed_unexp_v5",  # save results as csv: False or /path/tofolder
 
     # Settings:
     "extendable": {
@@ -180,17 +188,17 @@ args = {
     "debug_pre_market_slacks": False,
     "debug_market_model_slacks": False,
 
-    #"extra_functionality": {
-        #"biogas_sh_resource": {
-            #"csv_path": str(BIOGAS_SH_CSV),
-            #"eta_el": 0.38,
-            #"eta_heat": 0.45,
-            #"eta_upgrade": 0.96,
-            #"ignore_missing_components": True,
-       # },
-    #},
+    "extra_functionality": {
+        "biogas_sh_resource": {
+            "csv_path": str(BIOGAS_SH_CSV),
+            "eta_el": 0.38,
+            "eta_heat": 0.45,
+            "eta_upgrade": 0.96,
+            "ignore_missing_components": False,
+        },
+     },
 
-    "extra_functionality": {},
+    #"extra_functionality": {},
 
     # Spatial Complexity:
     "network_clustering_ehv": {
@@ -219,27 +227,44 @@ args = {
             "n_clusters": 50,  # total number of resulting AC nodes
             "k_elec_busmap": False,  # False or path/to/busmap.csv
         },
-        "gas_grids": {
-            "active": True,  # choose if clustering is activated
-            "cluster_within_focus": False,  # False for very low clustering within focus region
-            "n_clusters_ch4": 15,  # total number of resulting CH4 nodes
-            "n_clusters_h2": 15,  # total number of resulting H2 nodes
-            "k_ch4_busmap": False,  # False or path/to/ch4_busmap.csv
-            # New custom protection
+       "gas_grids": {
+           "active": True,
+           "cluster_within_focus": False,
+           "n_clusters_ch4": 15,
+           "n_clusters_h2": 15,
+           "k_ch4_busmap": False,
+
             "protect_custom_ch4_buses": True,
+
             "custom_ch4_buses": [
                 "47538",
                 "biogas_sh_swfl_ch4_bus",
-             ],
-             "custom_ch4_bus_prefixes": [
+                "biogas_sh_storage_ch4_bus",
+                "swfl_real_biomethane_ch4_bus",
+            ],
+
+            "custom_ch4_bus_prefixes": [
                 "biogas_sh_ch4_bus_",
-             ],
-             "custom_ch4_link_carriers": [
-                 "biogas_sh_swfl_direct",
-                 "biogas_sh_gas_grid_injection",
-                 "biogas_sh_swfl_grid_supply",
-             ],
-          },
+            ],
+
+            "custom_ch4_link_carriers": [
+                "biogas_sh_swfl_direct",
+                "biogas_sh_gas_grid_injection",
+                "biogas_sh_swfl_grid_supply",
+
+                # Plant -> central Biogas.SH storage
+                "biogas_sh_collection_to_storage",
+
+                # Central storage output routes
+                "biogas_sh_storage_to_grid",
+                "biogas_sh_storage_to_swfl",
+
+                # SWFL detailed fuel routes
+                "swfl_real_natural_gas_to_boiler",
+                "swfl_real_biomethane_to_boiler",
+                "swfl_real_gas_to_power",
+            ],
+        },
     },
 
     "spatial_disaggregation": None,  # None or 'uniform'
@@ -413,10 +438,13 @@ args = {
         "central_gas_chp": {
             "active": True,
 
+            # Keep only the temporary aggregate 241 MWel electricity side.
+            "add_electric_link": True,
+            "add_heat_link": False,
+
             "electric_link_name": "swfl_real_gas_to_power",
             "heat_link_name": "swfl_real_gas_to_heat",
 
-            # Capacities from Stadtwerke Flensburg.
             "electric_capacity_mw": 241.0,
             "heat_capacity_mw": 370.0,
 
@@ -427,19 +455,194 @@ args = {
             "carrier_el": "swfl_real_gas_to_power",
             "carrier_heat": "swfl_real_gas_to_heat",
 
-            # p_nom is interpreted as output-side capacity.
-            # With efficiency = 1.0, p_nom equals output capacity.
             "p_nom_is_output_capacity": True,
-            "electric_efficiency": 1.0,
-            "heat_efficiency": 1.0,
+
+            # Provisional assumption until SWFL provides verified data.
+            "electric_efficiency": 0.40,
+
+            # Not used while add_heat_link=False.
+            "heat_efficiency": 0.90,
 
             "extendable": False,
-
             "p_min_pu": 0.0,
             "p_max_pu": 1.0,
 
+            # Fuel cost is represented upstream.
             "marginal_cost": 0.0,
             "capital_cost": 0.0,
+        },
+
+        "central_heat_units": {
+            "active": True,
+
+            "natural_gas_bus": "biogas_sh_swfl_ch4_bus",
+            "biomethane_bus": "swfl_real_biomethane_ch4_bus",
+
+            "ac_bus": "33935",
+            "heat_bus": "swfl_real_central_heat_bus",
+
+            # --------------------------------------------------------------
+            # Biomethane scenario
+            # --------------------------------------------------------------
+            # "off"             -> no biomethane use
+            # "k12_k13_only"    -> K12 + K13 = 170 MWth
+            # "all_gas_units"   -> K5 + K11 + K12 + K13 = 300 MWth
+            # "custom"          -> use custom_biomethane_units
+            "biomethane_mode": "k12_k13_only",
+
+            "planned_biomethane_units": [
+                "swfl_real_k12",
+                "swfl_real_k13",
+            ],
+
+            "custom_biomethane_units": [
+                "swfl_real_k12",
+                "swfl_real_k13",
+            ],
+
+            # Normal eGon2035 case: no HEL.
+            "allow_hel_backup": False,
+
+            "hel_bus": "swfl_real_hel_bus",
+            "hel_supply_generator": "swfl_real_hel_supply",
+            "hel_supply_p_nom_mw": 1000.0,
+
+            # Only used when HEL backup is active.
+            "hel_marginal_cost": 0.0,
+
+            # Provisional assumptions until SWFL supplies efficiency data.
+            "default_boiler_efficiency": 0.90,
+            "default_resistive_efficiency": 0.99,
+
+            "expected_total_heat_capacity_mw": 370.0,
+
+            "boilers": [
+                {
+                    "name": "swfl_real_k5",
+                    "active": True,
+                    "heat_capacity_mw": 60.0,
+
+                    "base_fuels": [
+                        "natural_gas",
+                    ],
+
+                    "optional_fuels": [
+                        "hel",
+                    ],
+
+                    "efficiency": 0.90,
+                    "carrier": "central_gas_boiler",
+
+                    "extendable": False,
+                    "p_min_pu": 0.0,
+                    "p_max_pu": 1.0,
+
+                    "marginal_cost": 0.0,
+                    "capital_cost": 0.0,
+                },
+                {
+                    "name": "swfl_real_k11",
+                    "active": True,
+                    "heat_capacity_mw": 70.0,
+
+                    # eGon2035 model assumption:
+                    # K11 is represented as converted from coal to gas.
+                    "base_fuels": [
+                        "natural_gas",
+                    ],
+
+                    "optional_fuels": [],
+
+                    "efficiency": 0.90,
+                    "carrier": "central_gas_boiler",
+
+                    "extendable": False,
+                    "p_min_pu": 0.0,
+                    "p_max_pu": 1.0,
+
+                    "marginal_cost": 0.0,
+                    "capital_cost": 0.0,
+                },
+                {
+                    "name": "swfl_real_k12",
+                    "active": True,
+                    "heat_capacity_mw": 80.0,
+
+                    "base_fuels": [
+                        "natural_gas",
+                    ],
+
+                    "optional_fuels": [],
+
+                    "efficiency": 0.90,
+                    "carrier": "central_gas_boiler",
+
+                    "extendable": False,
+                    "p_min_pu": 0.0,
+                    "p_max_pu": 1.0,
+
+                    "marginal_cost": 0.0,
+                    "capital_cost": 0.0,
+                },
+                {
+                    "name": "swfl_real_k13",
+                    "active": True,
+                    "heat_capacity_mw": 90.0,
+
+                    "base_fuels": [
+                        "natural_gas",
+                    ],
+
+                    "optional_fuels": [],
+
+                    "efficiency": 0.90,
+                    "carrier": "central_gas_boiler",
+
+                    "extendable": False,
+                    "p_min_pu": 0.0,
+                    "p_max_pu": 1.0,
+
+                    "marginal_cost": 0.0,
+                    "capital_cost": 0.0,
+                },
+            ],
+
+            "resistive_heaters": [
+                {
+                    "name": "swfl_real_ehk1",
+                    "active": True,
+                    "heat_capacity_mw": 30.0,
+                    "efficiency": 0.99,
+                    "carrier": "central_resistive_heater",
+
+                    "ac_bus": "33935",
+                    "heat_bus": "swfl_real_central_heat_bus",
+
+                    "extendable": False,
+                    "p_min_pu": 0.0,
+                    "p_max_pu": 1.0,
+
+                    "marginal_cost": 0.0,
+                    "capital_cost": 0.0,
+                },
+                {
+                    "name": "swfl_real_ehk2",
+                    "active": True,
+                    "heat_capacity_mw": 40.0,
+                    "efficiency": 0.99,
+                    "carrier": "central_resistive_heater",
+
+                    "ac_bus": "33935",
+                    "heat_bus": "swfl_real_central_heat_bus",
+
+                    "extendable": False,
+                    "p_min_pu": 0.0,
+                    "p_max_pu": 1.0,
+
+                    "marginal_cost": 0.0,
+                    "capital_cost": 0.0,
+                },
+            ],
         },
 
         # ------------------------------------------------------------------
@@ -479,33 +682,15 @@ args = {
             "remove_existing_central_heat_pumps": True,
 
             # Main heat-pump scenario switch.
-            #
-            # False:
-            #   remove old eGon heat pumps, add no new SWFL heat pumps
-            #
-            # True:
-            #   add selected heat-pump units below
             "active": True,
 
-            # Flexible scenario examples:
-            #
-            # none:
-            #   "active": False
-            #
-            # only GWP 1:
-            #   "active": True,
-            #   "active_units": ["swfl_gwp_1"]
-            #
-            # only GWP 2:
-            #   "active": True,
-            #   "active_units": ["swfl_gwp_2"]
-            #
-            # both:
-            #   "active": True,
-            #   "active_units": ["swfl_gwp_1", "swfl_gwp_2"]
+            # Two-heat-pump scenario:
+            "active_units": [
+            "swfl_gwp_1",
+            "swfl_gwp_2",
+            ],
 
-            "carrier": "central_heat_pump",
-
+            # Do not define a shared central_heat_pump carrier here.
             "default_cop": 3.0,
 
             "extendable": False,
@@ -520,14 +705,18 @@ args = {
                 {
                     "name": "swfl_gwp_1",
 
-                    # Used only when active_units is not given.
+                    # Unique carrier prevents clustering with GWP 2
+                    # and generic eGon heat pumps.
+                    "carrier": "swfl_gwp_1_heat_pump",
+
+                    # This is ignored when active_units is defined,
+                    # but it can remain for compatibility.
                     "active": True,
 
-                    # Heat output capacity.
+                    # Useful heat-output capacity.
                     "heat_capacity_mw": 60.0,
 
-                    # COP = heat output / electricity input.
-                    # The module sets p_nom = heat_capacity_mw / cop.
+                    # p_nom = 60 MWth / 3 = 20 MWel.
                     "cop": 3.0,
 
                     "planned_year": 2028,
@@ -538,8 +727,10 @@ args = {
                 {
                     "name": "swfl_gwp_2",
 
-                    # Used only when active_units is not given.
-                    "active": False,
+                    # Separate carrier for GWP 2.
+                    "carrier": "swfl_gwp_2_heat_pump",
+
+                    "active": True,
 
                     "heat_capacity_mw": 60.0,
                     "cop": 3.0,
@@ -575,7 +766,6 @@ args = {
         # Legacy field kept for compatibility. If add_gas_grid_generation is absent,
         # this is interpreted as gas-grid generation.
         # "add_gas_generation": True,
-        "biomethane_price_override_eur_per_mwh": 25.0, #For normal CSV-based runs: None,
 
         # Public gas grid injection route.
         "gas_connection_target": "gas_grid",
@@ -612,8 +802,9 @@ args = {
             "grid_supply_extendable": False,
             "grid_supply_p_nom_factor": 1.0,
             "grid_supply_efficiency": 1.0,
-            "grid_supply_marginal_cost": 50.0,
+            "grid_supply_marginal_cost": 0.0, #TODO: should be checked
             "grid_supply_capital_cost": 0.0,
+            "grid_supply_p_nom": 1500.0,
 
             # Direct Biogas-SH plant CH4 buses -> SWFL CH4 bus.
             "direct_link_p_nom_factor": 1.0,
@@ -627,24 +818,33 @@ args = {
             "add_swfl_gas_load": False,
             "swfl_demand_mwh_a": 0.0,
         },
-        
+
         "gas_storage": {
             "active": True,
 
-            # One central Biogas.SH CH4 storage
             "bus": "biogas_sh_storage_ch4_bus",
             "store": "biogas_sh_ch4_store",
 
-            # Approximate location near SWFL / Flensburg
+            "country": "DE",
             "x": 9.436502119171873,
             "y": 54.79233181101448,
 
-            # Storage energy capacity [MWh_gas]
+            # Plant -> storage
+            "input_link_name_prefix": "biogas_sh_storage_input",
+            "input_link_carrier": "biogas_sh_collection_to_storage",
+            "input_link_p_nom_factor": 1.0,
+            "input_link_extendable": False,
+            "input_link_p_nom_min": 0.0,
+            "input_link_p_min_pu": 0.0,
+            "input_link_p_max_pu": 1.0,
+            "input_link_efficiency": 1.0,
+            "input_link_marginal_cost": 0.0,
+            "input_link_capital_cost": 0.0,
+
+            # Storage energy capacity
             "e_nom_mwh": 500.0,
             "e_nom_extendable": False,
             "e_nom_min": 0.0,
-
-            # Storage operation
             "e_initial": 0.0,
             "e_cyclic": True,
             "standing_loss": 0.0,
@@ -662,11 +862,19 @@ args = {
             "grid_link_efficiency": 1.0,
             "grid_link_marginal_cost": 0.0,
             "grid_link_capital_cost": 0.0,
-            
-            # Storage -> SWFL CH4 bus
-            "swfl_link": "biogas_sh_storage_to_swfl",
+
+            # Storage -> dedicated SWFL biomethane bus
+            "swfl_target_bus": "swfl_real_biomethane_ch4_bus",
+            "swfl_target_bus_x": 9.436502119171873,
+            "swfl_target_bus_y": 54.79233181101448,
+
+            "swfl_link": "biogas_sh_storage_to_swfl_biomethane",
             "swfl_link_carrier": "biogas_sh_storage_to_swfl",
+
+            # Keep 50 MWgas for the constrained test.
+            # Use 188.8889 MWgas to enable 170 MWth at eta=0.90.
             "swfl_link_p_nom_mw": 50.0,
+
             "swfl_link_extendable": False,
             "swfl_link_p_nom_min": 0.0,
             "swfl_link_p_min_pu": 0.0,
@@ -674,7 +882,7 @@ args = {
             "swfl_link_efficiency": 1.0,
             "swfl_link_marginal_cost": 0.0,
             "swfl_link_capital_cost": 0.0,
-        },  
+        },
 
         # ------------------------------------------------------------------
         # Demand-side mapping
@@ -718,10 +926,13 @@ args = {
         #   Full EEG:    102.4 €/MWh_el
 
         "electricity_marginal_cost": 102.4,  # Full EEG case; No EEG: 189.5, 50% EEG: 146.0
-        "heat_marginal_cost": 0.0,
-        "default_biomethane_cost": -10.0, #75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
+        "heat_marginal_cost": 0.0, #TODO: should be checked
+        "biomethane_price_override_eur_per_mwh": 25.0,
+        "default_biomethane_cost": 75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
         },
 }
+
+
 
 def run_etrago(args, json_path):
     """Function to conduct optimization considering the following arguments.
@@ -922,7 +1133,7 @@ def run_etrago(args, json_path):
             Limit AC cross-border-flows between Germany and its neighbouring
             countries. Set values in MWh for all snapshots, e.g. [-x, y]
             (with x Import, y Export, positive: export from Germany).
-        * 'cross_border_flows_per_country' : dict of cntr and array of floats
+        * 'cross_border etrago.spatial_clustering_gas()_flows_per_country' : dict of cntr and array of floats
             Limit AC cross-border-flows between Germany and its neighbouring
             countries. Set values in MWh for each country, e.g. [-x, y]
             (with x Import, y Export, positive: export from Germany).
@@ -1169,47 +1380,46 @@ def run_etrago(args, json_path):
     etrago.build_network_from_db()
 
     # adjust network regarding eTraGo setting
-    # adjust network regarding eTraGo setting
     etrago.adjust_network()
 
+    # Add the detailed SWFL assets
     apply_swfl_real_system(
         etrago.network,
         args.get("swfl_real_system", {}),
     )
 
+    # Biogas.SH connects to buses created by the SWFL setup
     apply_biogas_sh_assets(etrago)
 
-    ensure_swfl_public_ch4_supply_link(
-        etrago.network,
-        link_name="biogas_sh_swfl_grid_supply_47538_to_swfl",
-        public_ch4_bus="47538",
-        swfl_ch4_bus="biogas_sh_swfl_ch4_bus",
-        p_nom=1000.0,
-        marginal_cost=50.0,
-        scn_name=args.get("scn_name", "eGon2035"),
-    )
-
-    #ensure_swfl_ch4_import_generator(
-        #etrago.network,
-        #generator_name="swfl_real_ch4_import_generator",
-        #swfl_ch4_bus="biogas_sh_swfl_ch4_bus",
-        #p_nom=1000.0,
-        #marginal_cost=50.0,
-        #scn_name=args.get("scn_name", "eGon2035"),
-    #)
-
+    # Assign the selected scenario name to custom components
     fix_custom_component_scn_names(
         etrago.network,
         scn_name=args.get("scn_name", "eGon2035"),
     )
 
+    # Validate the Biogas.SH storage topology before clustering.
+    validate_biogas_sh_storage_topology(
+        network=etrago.network,
+        args=args,
+    )
 
-    # ehv network clustering
-    etrago.ehv_clustering()
+    # remove the original eGon heat pump
 
-    # spatial clustering
+    remove_known_legacy_swfl_heat_pump_before_clustering(
+        etrago.network,
+    )
+
     etrago.spatial_clustering()
+
+    # Defensive post-clustering cleanup.
+    purge_legacy_swfl_heat_pumps(
+        etrago.network,
+        stage="after spatial clustering",
+    )
+
+
     etrago.spatial_clustering_gas()
+
 
     # snapshot clustering
     etrago.snapshot_clustering()
@@ -1217,18 +1427,6 @@ def run_etrago(args, json_path):
     # skip snapshots
     etrago.skip_snapshots()
 
-    diagnose_swfl_market_balance(
-        etrago.network,
-        swfl_ch4_bus="biogas_sh_swfl_ch4_bus",
-        swfl_heat_bus="swfl_real_central_heat_bus",
-        swfl_ac_bus="33935",
-    )
-
-       # etrago.network,
-        #p_nom=1_000_000.0,
-        #marginal_cost=1_000_000.0,
-        #scn_name=args.get("scn_name", "eGon2035"),
-    #)
 
     n = etrago.network
 
@@ -1237,61 +1435,8 @@ def run_etrago(args, json_path):
     print("Generators:", n.generators.shape)
     print("Stores:", n.stores.shape)
 
-# Undefined buses in links
-    bad_links = n.links[
-        ~n.links.bus0.isin(n.buses.index)
-        | ~n.links.bus1.isin(n.buses.index)
-    ]
-
-    print("Links with undefined buses:", len(bad_links))
-    print(bad_links[["carrier", "bus0", "bus1", "p_nom"]].head(50))
-
-# Undefined buses in generators
-    bad_gens = n.generators[
-        ~n.generators.bus.isin(n.buses.index)
-    ]
-
-    print("Generators with undefined buses:", len(bad_gens))
-    print(bad_gens[["carrier", "bus", "p_nom"]].head(50))
-
-# NaNs in important link fields
-    link_cols = [
-        "p_nom",
-        "efficiency",
-        "marginal_cost",
-        "capital_cost",
-        "p_min_pu",
-        "p_max_pu",
-    ]
-
-    for col in link_cols:
-       if col in n.links.columns:
-           bad = n.links[n.links[col].isna()]
-           print(f"Links with NaN {col}:", len(bad))
-           if len(bad):
-               print(bad[["carrier", "bus0", "bus1", col]].head(20))
-
-# NaNs in important generator fields
-    gen_cols = [
-       "p_nom",
-       "marginal_cost",
-       "capital_cost",
-       "p_min_pu",
-       "p_max_pu",
-    ]
-
-    for col in gen_cols:
-       if col in n.generators.columns:
-           bad = n.generators[n.generators[col].isna()]
-           print(f"Generators with NaN {col}:", len(bad))
-           if len(bad):
-                print(bad[["carrier", "bus", col]].head(20))
-
-# Consistency check
+    # Consistency check
     n.consistency_check()
-
-
-
 
     # start linear optimal powerflow calculations
     etrago.optimize()

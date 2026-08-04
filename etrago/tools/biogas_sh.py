@@ -238,7 +238,6 @@ def _read_mv_grid_districts(settings):
     if not gpkg.exists():
         raise FileNotFoundError(f"MV grid districts GeoPackage not found: {gpkg}")
 
-    import geopandas as gpd
 
     layer = settings.get("mv_grid_layer")
     districts = gpd.read_file(gpkg) if not layer else gpd.read_file(gpkg, layer=layer)
@@ -1040,18 +1039,60 @@ def _add_ch4_grid_link_from_plant(
     target_ch4_bus: str,
     p_nom: float,
     settings,
-) -> None:
-    """Add one-way Biogas-SH plant CH4 bus -> public CH4 grid injection link."""
-    link_name = f"biogas_sh_ch4_grid_link_{plant_id}_to_{target_ch4_bus}"
+) -> str:
+    """
+    Add a one-way link from a Biogas.SH plant CH4 bus to the public CH4 grid.
 
-    _remove_component_if_exists(network, "Link", link_name)
+    This function is only intended for direct public-grid injection:
 
-    link_factor = float(settings.get("ch4_link_p_nom_factor", 1.0))
-    link_p_nom = max(float(p_nom) * link_factor, 0.0)
+        plant CH4 bus -> public CH4 grid
+    """
+    plant_bus = str(plant_bus)
+    target_ch4_bus = str(target_ch4_bus)
 
-    ch4_link_carrier = settings.get(
-        "ch4_link_carrier",
-        "biogas_sh_gas_grid_injection",
+    if plant_bus not in network.buses.index:
+        raise ValueError(
+            f"Biogas.SH plant CH4 bus {plant_bus!r} does not exist."
+        )
+
+    if target_ch4_bus not in network.buses.index:
+        raise ValueError(
+            f"Public CH4 target bus {target_ch4_bus!r} does not exist."
+        )
+
+    link_name = (
+        f"biogas_sh_ch4_grid_link_"
+        f"{plant_id}_to_{target_ch4_bus}"
+    )
+
+    link_carrier = str(
+        settings.get(
+            "ch4_link_carrier",
+            "biogas_sh_gas_grid_injection",
+        )
+    )
+
+    _ensure_carrier(
+        network,
+        link_carrier,
+    )
+
+    _remove_component_if_exists(
+        network,
+        "Link",
+        link_name,
+    )
+
+    link_factor = float(
+        settings.get(
+            "ch4_link_p_nom_factor",
+            1.0,
+        )
+    )
+
+    link_p_nom = max(
+        float(p_nom) * link_factor,
+        0.0,
     )
 
     network.add(
@@ -1059,16 +1100,246 @@ def _add_ch4_grid_link_from_plant(
         link_name,
         bus0=plant_bus,
         bus1=target_ch4_bus,
-        carrier=ch4_link_carrier,
+        carrier=link_carrier,
         p_nom=link_p_nom,
-        p_nom_extendable=_as_bool(settings.get("ch4_link_extendable", False), False),
-        p_nom_min=0.0,
-        p_min_pu=float(settings.get("ch4_link_p_min_pu", 0.0)),
-        p_max_pu=1.0,
-        efficiency=float(settings.get("ch4_link_efficiency", 1.0)),
-        marginal_cost=float(settings.get("ch4_link_marginal_cost", 0.0)),
-        capital_cost=float(settings.get("ch4_link_capital_cost", 0.0)),
+        p_nom_extendable=_as_bool(
+            settings.get(
+                "ch4_link_extendable",
+                False,
+            ),
+            False,
+        ),
+        p_nom_min=float(
+            settings.get(
+                "ch4_link_p_nom_min",
+                0.0,
+            )
+        ),
+        p_min_pu=float(
+            settings.get(
+                "ch4_link_p_min_pu",
+                0.0,
+            )
+        ),
+        p_max_pu=float(
+            settings.get(
+                "ch4_link_p_max_pu",
+                1.0,
+            )
+        ),
+        efficiency=float(
+            settings.get(
+                "ch4_link_efficiency",
+                1.0,
+            )
+        ),
+        marginal_cost=float(
+            settings.get(
+                "ch4_link_marginal_cost",
+                0.0,
+            )
+        ),
+        capital_cost=float(
+            settings.get(
+                "ch4_link_capital_cost",
+                0.0,
+            )
+        ),
     )
+
+    return link_name
+
+def _add_ch4_storage_input_link_from_plant(
+    network,
+    plant_id: int,
+    plant_bus: str,
+    storage_bus: str,
+    p_nom: float,
+    settings,
+) -> str:
+    """
+    Add a one-way collection link from a Biogas.SH plant CH4 bus
+    to the central Biogas.SH storage bus.
+
+    Topology:
+
+        plant-specific CH4 bus
+                  |
+                  v
+        central Biogas.SH storage bus
+
+    This link is not a public gas-grid injection link. It represents
+    collection and transport of biomethane from a plant to the common
+    Biogas.SH storage.
+    """
+    cfg = _biogas_sh_storage_settings(settings)
+
+    plant_bus = str(plant_bus)
+    storage_bus = str(storage_bus)
+
+    if plant_bus not in network.buses.index:
+        raise ValueError(
+            f"Biogas.SH plant CH4 bus {plant_bus!r} does not exist."
+        )
+
+    if storage_bus not in network.buses.index:
+        raise ValueError(
+            f"Biogas.SH storage bus {storage_bus!r} does not exist."
+        )
+
+    name_prefix = str(
+        cfg.get(
+            "input_link_name_prefix",
+            "biogas_sh_storage_input",
+        )
+    ).strip()
+
+    if not name_prefix:
+        raise ValueError(
+            "biogas_sh.gas_storage.input_link_name_prefix "
+            "must not be empty."
+        )
+
+    link_name = (
+        f"{name_prefix}_{plant_id}_to_{storage_bus}"
+    )
+
+    link_carrier = str(
+        cfg.get(
+            "input_link_carrier",
+            "biogas_sh_collection_to_storage",
+        )
+    ).strip()
+
+    if not link_carrier:
+        raise ValueError(
+            "biogas_sh.gas_storage.input_link_carrier "
+            "must not be empty."
+        )
+
+    _ensure_carrier(
+        network,
+        link_carrier,
+    )
+
+    _remove_component_if_exists(
+        network,
+        "Link",
+        link_name,
+    )
+
+    # Normally one MW of plant biomethane-production capacity receives
+    # one MW of transport capacity to the storage.
+    link_factor = float(
+        cfg.get(
+            "input_link_p_nom_factor",
+            1.0,
+        )
+    )
+
+    if link_factor < 0:
+        raise ValueError(
+            "biogas_sh.gas_storage.input_link_p_nom_factor "
+            "must be non-negative."
+        )
+
+    link_p_nom = max(
+        float(p_nom) * link_factor,
+        0.0,
+    )
+
+    efficiency = float(
+        cfg.get(
+            "input_link_efficiency",
+            1.0,
+        )
+    )
+
+    if efficiency <= 0:
+        raise ValueError(
+            "biogas_sh.gas_storage.input_link_efficiency "
+            "must be greater than zero."
+        )
+
+    p_min_pu = float(
+        cfg.get(
+            "input_link_p_min_pu",
+            0.0,
+        )
+    )
+
+    p_max_pu = float(
+        cfg.get(
+            "input_link_p_max_pu",
+            1.0,
+        )
+    )
+
+    if p_min_pu > p_max_pu:
+        raise ValueError(
+            "biogas_sh.gas_storage.input_link_p_min_pu "
+            "must not exceed input_link_p_max_pu."
+        )
+
+    network.add(
+        "Link",
+        link_name,
+        bus0=plant_bus,
+        bus1=storage_bus,
+        carrier=link_carrier,
+
+        # PyPSA Link p_nom is the input-side gas-flow capacity.
+        p_nom=link_p_nom,
+
+        p_nom_extendable=_as_bool(
+            cfg.get(
+                "input_link_extendable",
+                False,
+            ),
+            False,
+        ),
+        p_nom_min=float(
+            cfg.get(
+                "input_link_p_nom_min",
+                0.0,
+            )
+        ),
+
+        # One-way plant-to-storage flow by default.
+        p_min_pu=p_min_pu,
+        p_max_pu=p_max_pu,
+
+        efficiency=efficiency,
+
+        marginal_cost=float(
+            cfg.get(
+                "input_link_marginal_cost",
+                0.0,
+            )
+        ),
+        capital_cost=float(
+            cfg.get(
+                "input_link_capital_cost",
+                0.0,
+            )
+        ),
+    )
+
+    # Optional metadata for easier reporting.
+    try:
+        network.links.loc[
+            link_name,
+            "biogas_sh_route",
+        ] = "plant_to_storage"
+
+        network.links.loc[
+            link_name,
+            "biogas_sh_plant_id",
+        ] = int(plant_id)
+    except Exception:
+        pass
+
+    return link_name
 
 
 def _add_swfl_direct_link_from_plant(network, plant_id: int, plant_bus: str, swfl_bus: str, p_nom: float, settings) -> None:
@@ -1097,53 +1368,288 @@ def _biogas_sh_storage_settings(settings) -> dict:
     return cfg
 
 
-def _ensure_biogas_sh_single_storage(network, settings) -> tuple[str, bool]:
+def _ensure_biogas_sh_single_storage(
+    network,
+    settings,
+) -> tuple[Optional[str], bool]:
     """
-    Add one central Biogas.SH CH4 storage.
+    Add or update one central Biogas.SH CH4 storage.
 
-    Topology:
+    Topology
+    --------
         Biogas.SH plant CH4 buses
-              -> biogas_sh_storage_ch4_bus
-              <-> biogas_sh_ch4_store
-              -> SWFL CH4 bus
-              -> public CH4 grid
+                    |
+                    v
+        biogas_sh_storage_ch4_bus
+                    |
+                    <-> biogas_sh_ch4_store
+                    |
+                    +----> public CH4 grid
+                    |
+                    +----> dedicated SWFL biomethane bus
+
+    Returns
+    -------
+    tuple[Optional[str], bool]
+        storage_bus:
+            Name of the storage bus when storage is active, otherwise None.
+
+        storage_active:
+            True when the storage was created or updated, otherwise False.
     """
     cfg = _biogas_sh_storage_settings(settings)
 
-    if not _as_bool(cfg.get("active", False), False):
+    # ------------------------------------------------------------------
+    # 1. Activation check
+    # ------------------------------------------------------------------
+    if not _as_bool(
+        cfg.get("active", False),
+        False,
+    ):
         return None, False
 
-    storage_bus = str(cfg.get("bus", "biogas_sh_storage_ch4_bus"))
-    storage_name = str(cfg.get("store", "biogas_sh_ch4_store"))
+    # ------------------------------------------------------------------
+    # 2. Component names and location
+    # ------------------------------------------------------------------
+    storage_bus = str(
+        cfg.get(
+            "bus",
+            "biogas_sh_storage_ch4_bus",
+        )
+    ).strip()
 
-    # approximate location near Flensburg / SWFL
-    x = float(cfg.get("x", 9.436502119171873))
-    y = float(cfg.get("y", 54.79233181101448))
+    storage_name = str(
+        cfg.get(
+            "store",
+            "biogas_sh_ch4_store",
+        )
+    ).strip()
 
-    if storage_bus not in network.buses.index:
+    if not storage_bus:
+        raise ValueError(
+            "biogas_sh.gas_storage.bus must not be empty."
+        )
+
+    if not storage_name:
+        raise ValueError(
+            "biogas_sh.gas_storage.store must not be empty."
+        )
+
+    # Approximate location near Flensburg/SWFL unless configured otherwise.
+    x = float(
+        cfg.get(
+            "x",
+            9.436502119171873,
+        )
+    )
+
+    y = float(
+        cfg.get(
+            "y",
+            54.79233181101448,
+        )
+    )
+
+    country = str(
+        cfg.get(
+            "country",
+            "DE",
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Storage parameters
+    # ------------------------------------------------------------------
+    e_nom = float(
+        cfg.get(
+            "e_nom_mwh",
+            500.0,
+        )
+    )
+
+    e_nom_extendable = _as_bool(
+        cfg.get(
+            "e_nom_extendable",
+            False,
+        ),
+        False,
+    )
+
+    e_nom_min = float(
+        cfg.get(
+            "e_nom_min",
+            0.0,
+        )
+    )
+
+    e_initial = float(
+        cfg.get(
+            "e_initial",
+            0.0,
+        )
+    )
+
+    e_cyclic = _as_bool(
+        cfg.get(
+            "e_cyclic",
+            True,
+        ),
+        True,
+    )
+
+    standing_loss = float(
+        cfg.get(
+            "standing_loss",
+            0.0,
+        )
+    )
+
+    marginal_cost = float(
+        cfg.get(
+            "marginal_cost",
+            0.0,
+        )
+    )
+
+    capital_cost = float(
+        cfg.get(
+            "capital_cost",
+            0.0,
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Parameter validation
+    # ------------------------------------------------------------------
+    if e_nom < 0:
+        raise ValueError(
+            "biogas_sh.gas_storage.e_nom_mwh must be non-negative."
+        )
+
+    if e_nom_min < 0:
+        raise ValueError(
+            "biogas_sh.gas_storage.e_nom_min must be non-negative."
+        )
+
+    if not e_nom_extendable and e_nom_min > e_nom:
+        raise ValueError(
+            "For fixed storage capacity, "
+            "biogas_sh.gas_storage.e_nom_min must not exceed e_nom_mwh."
+        )
+
+    if e_initial < 0:
+        raise ValueError(
+            "biogas_sh.gas_storage.e_initial must be non-negative."
+        )
+
+    if not e_nom_extendable and e_initial > e_nom:
+        raise ValueError(
+            "For fixed storage capacity, "
+            "biogas_sh.gas_storage.e_initial must not exceed e_nom_mwh."
+        )
+
+    if not 0.0 <= standing_loss < 1.0:
+        raise ValueError(
+            "biogas_sh.gas_storage.standing_loss must be "
+            "greater than or equal to 0 and smaller than 1."
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Ensure CH4 carrier
+    # ------------------------------------------------------------------
+    _ensure_carrier(
+        network,
+        "CH4",
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Add or update the storage bus
+    # ------------------------------------------------------------------
+    if storage_bus in network.buses.index:
+        network.buses.loc[
+            storage_bus,
+            "carrier",
+        ] = "CH4"
+
+        network.buses.loc[
+            storage_bus,
+            "country",
+        ] = country
+
+        network.buses.loc[
+            storage_bus,
+            "x",
+        ] = x
+
+        network.buses.loc[
+            storage_bus,
+            "y",
+        ] = y
+
+    else:
         network.add(
             "Bus",
             storage_bus,
             carrier="CH4",
+            country=country,
             x=x,
             y=y,
         )
 
-    _remove_component_if_exists(network, "Store", storage_name)
+    # ------------------------------------------------------------------
+    # 7. Recreate the Store component
+    # ------------------------------------------------------------------
+    _remove_component_if_exists(
+        network,
+        "Store",
+        storage_name,
+    )
 
     network.add(
         "Store",
         storage_name,
         bus=storage_bus,
         carrier="CH4",
-        e_nom=float(cfg.get("e_nom_mwh", 500.0)),
-        e_nom_extendable=_as_bool(cfg.get("e_nom_extendable", False), False),
-        e_nom_min=float(cfg.get("e_nom_min", 0.0)),
-        e_initial=float(cfg.get("e_initial", 0.0)),
-        e_cyclic=_as_bool(cfg.get("e_cyclic", True), True),
-        standing_loss=float(cfg.get("standing_loss", 0.0)),
-        marginal_cost=float(cfg.get("marginal_cost", 0.0)),
-        capital_cost=float(cfg.get("capital_cost", 0.0)),
+
+        # Energy capacity in MWh_CH4.
+        e_nom=e_nom,
+        e_nom_extendable=e_nom_extendable,
+        e_nom_min=e_nom_min,
+
+        # Initial and terminal storage conditions.
+        e_initial=e_initial,
+        e_cyclic=e_cyclic,
+
+        # Storage losses and costs.
+        standing_loss=standing_loss,
+        marginal_cost=marginal_cost,
+        capital_cost=capital_cost,
+    )
+
+    # ------------------------------------------------------------------
+    # 8. Optional metadata for reporting
+    # ------------------------------------------------------------------
+    try:
+        network.stores.loc[
+            storage_name,
+            "storage_type",
+        ] = "biogas_sh_central_ch4_storage"
+
+        network.stores.loc[
+            storage_name,
+            "configured_e_nom_mwh",
+        ] = e_nom
+    except Exception:
+        # Metadata are optional and must not prevent model construction.
+        pass
+
+    logger.info(
+        "Biogas.SH CH4 storage created or updated: "
+        "store=%s, bus=%s, e_nom=%.3f MWh, extendable=%s",
+        storage_name,
+        storage_bus,
+        e_nom,
+        e_nom_extendable,
     )
 
     return storage_bus, True
@@ -1159,70 +1665,336 @@ def _add_biogas_sh_storage_output_links(
     swfl_bus: str = None,
 ) -> None:
     """
-    Add output links from the single Biogas.SH storage bus to:
-    1) public CH4 grid
-    2) SWFL CH4 bus
+    Add one-way output links from the central Biogas.SH storage bus.
+
+    Routes
+    ------
+    1. Storage -> public CH4 grid
+    2. Storage -> dedicated SWFL biomethane bus
+
+    Natural gas and biomethane must remain on separate SWFL buses.
     """
     cfg = _biogas_sh_storage_settings(settings)
 
+    storage_bus = str(storage_bus).strip()
+
+    if storage_bus not in network.buses.index:
+        raise ValueError(
+            f"Biogas.SH storage bus {storage_bus!r} does not exist."
+        )
+
+    # =========================================================================
+    # 1. Storage -> public CH4 grid
+    # =========================================================================
     if add_gas_grid_generation:
+        target_ch4_bus = _clean_id(target_ch4_bus)
+
         if target_ch4_bus is None:
-            raise ValueError("target_ch4_bus is required for storage-to-grid link.")
+            raise ValueError(
+                "target_ch4_bus is required for the "
+                "storage-to-public-grid route."
+            )
+
+        if target_ch4_bus not in network.buses.index:
+            raise ValueError(
+                f"Public CH4 target bus {target_ch4_bus!r} "
+                "does not exist."
+            )
 
         grid_link = str(
             cfg.get(
                 "grid_link",
                 f"biogas_sh_storage_to_grid_{target_ch4_bus}",
             )
+        ).strip()
+
+        grid_carrier = str(
+            cfg.get(
+                "grid_link_carrier",
+                "biogas_sh_storage_to_grid",
+            )
+        ).strip()
+
+        if not grid_link:
+            raise ValueError(
+                "biogas_sh.gas_storage.grid_link must not be empty."
+            )
+
+        if not grid_carrier:
+            raise ValueError(
+                "biogas_sh.gas_storage.grid_link_carrier "
+                "must not be empty."
+            )
+
+        _ensure_carrier(
+            network,
+            grid_carrier,
         )
 
-        _remove_component_if_exists(network, "Link", grid_link)
+        _remove_component_if_exists(
+            network,
+            "Link",
+            grid_link,
+        )
 
         network.add(
             "Link",
             grid_link,
             bus0=storage_bus,
             bus1=target_ch4_bus,
-            carrier=str(cfg.get("grid_link_carrier", "biogas_sh_storage_to_grid")),
-            p_nom=float(cfg.get("grid_link_p_nom_mw", 50.0)),
-            p_nom_extendable=_as_bool(cfg.get("grid_link_extendable", False), False),
-            p_nom_min=float(cfg.get("grid_link_p_nom_min", 0.0)),
-            p_min_pu=float(cfg.get("grid_link_p_min_pu", 0.0)),
-            p_max_pu=float(cfg.get("grid_link_p_max_pu", 1.0)),
-            efficiency=float(cfg.get("grid_link_efficiency", 1.0)),
-            marginal_cost=float(cfg.get("grid_link_marginal_cost", 0.0)),
-            capital_cost=float(cfg.get("grid_link_capital_cost", 0.0)),
+            carrier=grid_carrier,
+            p_nom=float(
+                cfg.get(
+                    "grid_link_p_nom_mw",
+                    50.0,
+                )
+            ),
+            p_nom_extendable=_as_bool(
+                cfg.get(
+                    "grid_link_extendable",
+                    False,
+                ),
+                False,
+            ),
+            p_nom_min=float(
+                cfg.get(
+                    "grid_link_p_nom_min",
+                    0.0,
+                )
+            ),
+            p_min_pu=float(
+                cfg.get(
+                    "grid_link_p_min_pu",
+                    0.0,
+                )
+            ),
+            p_max_pu=float(
+                cfg.get(
+                    "grid_link_p_max_pu",
+                    1.0,
+                )
+            ),
+            efficiency=float(
+                cfg.get(
+                    "grid_link_efficiency",
+                    1.0,
+                )
+            ),
+            marginal_cost=float(
+                cfg.get(
+                    "grid_link_marginal_cost",
+                    0.0,
+                )
+            ),
+            capital_cost=float(
+                cfg.get(
+                    "grid_link_capital_cost",
+                    0.0,
+                )
+            ),
         )
 
+    # =========================================================================
+    # 2. Storage -> dedicated SWFL biomethane bus
+    # =========================================================================
     if add_swfl_direct_supply:
-        if swfl_bus is None:
-            raise ValueError("swfl_bus is required for storage-to-SWFL link.")
+        configured_target = cfg.get(
+            "swfl_target_bus",
+            None,
+        )
+
+        if configured_target is None or _is_missing(configured_target):
+            raise ValueError(
+                "Biogas.SH storage-to-SWFL supply is active, but "
+                "biogas_sh.gas_storage.swfl_target_bus is not set. "
+                "Set it to 'swfl_real_biomethane_ch4_bus'."
+            )
+
+        swfl_target_bus = str(
+            configured_target
+        ).strip()
+
+        if not swfl_target_bus:
+            raise ValueError(
+                "biogas_sh.gas_storage.swfl_target_bus "
+                "must not be empty."
+            )
+
+        # Prevent accidental mixing of biomethane and public natural gas.
+        if (
+            swfl_bus is not None
+            and swfl_target_bus == str(swfl_bus)
+        ):
+            raise ValueError(
+                "The storage SWFL target bus is identical to the "
+                "SWFL natural-gas bus. Set "
+                "gas_storage.swfl_target_bus to "
+                "'swfl_real_biomethane_ch4_bus'."
+            )
+
+        target_x = float(
+            cfg.get(
+                "swfl_target_bus_x",
+                9.436502119171873,
+            )
+        )
+
+        target_y = float(
+            cfg.get(
+                "swfl_target_bus_y",
+                54.79233181101448,
+            )
+        )
+
+        if swfl_target_bus in network.buses.index:
+            network.buses.loc[
+                swfl_target_bus,
+                "carrier",
+            ] = "CH4"
+
+            network.buses.loc[
+                swfl_target_bus,
+                "country",
+            ] = "DE"
+
+            network.buses.loc[
+                swfl_target_bus,
+                "x",
+            ] = target_x
+
+            network.buses.loc[
+                swfl_target_bus,
+                "y",
+            ] = target_y
+
+        else:
+            network.add(
+                "Bus",
+                swfl_target_bus,
+                carrier="CH4",
+                country="DE",
+                x=target_x,
+                y=target_y,
+            )
 
         swfl_link = str(
             cfg.get(
                 "swfl_link",
-                f"biogas_sh_storage_to_swfl_{swfl_bus}",
+                (
+                    "biogas_sh_storage_to_"
+                    f"{swfl_target_bus}"
+                ),
             )
+        ).strip()
+
+        swfl_carrier = str(
+            cfg.get(
+                "swfl_link_carrier",
+                "biogas_sh_storage_to_swfl",
+            )
+        ).strip()
+
+        if not swfl_link:
+            raise ValueError(
+                "biogas_sh.gas_storage.swfl_link must not be empty."
+            )
+
+        if not swfl_carrier:
+            raise ValueError(
+                "biogas_sh.gas_storage.swfl_link_carrier "
+                "must not be empty."
+            )
+
+        _ensure_carrier(
+            network,
+            swfl_carrier,
         )
 
-        _remove_component_if_exists(network, "Link", swfl_link)
+        _remove_component_if_exists(
+            network,
+            "Link",
+            swfl_link,
+        )
 
         network.add(
             "Link",
             swfl_link,
             bus0=storage_bus,
-            bus1=swfl_bus,
-            carrier=str(cfg.get("swfl_link_carrier", "biogas_sh_storage_to_swfl")),
-            p_nom=float(cfg.get("swfl_link_p_nom_mw", 50.0)),
-            p_nom_extendable=_as_bool(cfg.get("swfl_link_extendable", False), False),
-            p_nom_min=float(cfg.get("swfl_link_p_nom_min", 0.0)),
-            p_min_pu=float(cfg.get("swfl_link_p_min_pu", 0.0)),
-            p_max_pu=float(cfg.get("swfl_link_p_max_pu", 1.0)),
-            efficiency=float(cfg.get("swfl_link_efficiency", 1.0)),
-            marginal_cost=float(cfg.get("swfl_link_marginal_cost", 0.0)),
-            capital_cost=float(cfg.get("swfl_link_capital_cost", 0.0)),
+            bus1=swfl_target_bus,
+            carrier=swfl_carrier,
+            p_nom=float(
+                cfg.get(
+                    "swfl_link_p_nom_mw",
+                    50.0,
+                )
+            ),
+            p_nom_extendable=_as_bool(
+                cfg.get(
+                    "swfl_link_extendable",
+                    False,
+                ),
+                False,
+            ),
+            p_nom_min=float(
+                cfg.get(
+                    "swfl_link_p_nom_min",
+                    0.0,
+                )
+            ),
+            p_min_pu=float(
+                cfg.get(
+                    "swfl_link_p_min_pu",
+                    0.0,
+                )
+            ),
+            p_max_pu=float(
+                cfg.get(
+                    "swfl_link_p_max_pu",
+                    1.0,
+                )
+            ),
+            efficiency=float(
+                cfg.get(
+                    "swfl_link_efficiency",
+                    1.0,
+                )
+            ),
+            marginal_cost=float(
+                cfg.get(
+                    "swfl_link_marginal_cost",
+                    0.0,
+                )
+            ),
+            capital_cost=float(
+                cfg.get(
+                    "swfl_link_capital_cost",
+                    0.0,
+                )
+            ),
         )
 
+        # Final topology validation.
+        actual_target = str(
+            network.links.at[
+                swfl_link,
+                "bus1",
+            ]
+        )
+
+        if actual_target != swfl_target_bus:
+            raise RuntimeError(
+                f"Storage-to-SWFL link {swfl_link!r} has bus1="
+                f"{actual_target!r}, expected {swfl_target_bus!r}."
+            )
+
+        logger.info(
+            "Biogas.SH storage-to-SWFL link created: "
+            "%s -> %s, carrier=%s, p_nom=%.3f MW",
+            storage_bus,
+            swfl_target_bus,
+            swfl_carrier,
+            float(network.links.at[swfl_link, "p_nom"]),
+        )
 
 # =============================================================================
 # Public function attached to Etrago in network.py
@@ -1231,74 +2003,152 @@ def _add_biogas_sh_storage_output_links(
 
 def apply_biogas_sh_assets(self) -> None:
     """
-    Add Biogas.SH assets with flexible onsite, public gas-grid, and SWFL-direct routes.
+    Add project-specific Biogas.SH assets to the PyPSA network.
 
-    Routes
-    ------
-    add_local_generation:
-        Adds onsite electricity and heat generators at mapped AC / heat buses.
+    Supported routes
+    ----------------
+    1. Onsite generation
+       - Plant electricity generation at mapped AC buses.
+       - Plant heat generation at mapped heat buses.
 
-    add_gas_grid_generation:
-        Adds plant CH4 buses, CH4_biogas generators, and links to the public CH4 grid.
+    2. Public gas-grid injection
+       Without central storage:
+           plant CH4 bus -> public CH4 grid
 
-    add_swfl_direct_supply:
-        Adds plant CH4 buses, CH4_biogas generators, and direct links to the SWFL CH4 bus.
+       With central storage:
+           plant CH4 bus -> central Biogas.SH storage
+           central storage -> public CH4 grid
+
+    3. Direct SWFL biomethane supply
+       Without central storage:
+           plant CH4 bus -> SWFL CH4 bus
+
+       With central storage:
+           plant CH4 bus -> central Biogas.SH storage
+           central storage -> dedicated SWFL biomethane bus
 
     Important
     ---------
-    Onsite generators use custom Biogas.SH carriers by default so they remain
-    identifiable after clustering/export:
-        - biogas_sh_onsite_el
-        - biogas_sh_onsite_chp_el
-        - biogas_sh_onsite_chp_heat
+    When the central Biogas.SH storage is active, every plant is connected
+    to the storage through the dedicated carrier:
+
+        biogas_sh_collection_to_storage
+
+    These collection links are not counted or classified as public gas-grid
+    injection links.
     """
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # 1. Read and validate settings
-    # -------------------------------------------------------------------------
-    settings = self.args.get("biogas_sh", {})
+    # =========================================================================
+    settings = self.args.get("biogas_sh", {}) or {}
 
-    if not settings or not _as_bool(settings.get("active", False), False):
-        logger.info("Biogas.SH assets not active.")
+    if not _as_bool(
+        settings.get("active", False),
+        False,
+    ):
+        logger.info(
+            "Biogas.SH assets inactive; network remains unchanged."
+        )
         return
 
     csv_path = settings.get("csv_path")
-    if csv_path is None:
-        raise ValueError("args['biogas_sh']['csv_path'] must be set.")
 
-    route_mode, add_local_generation, add_gas_grid_generation, add_swfl_direct_supply = (
-        _resolve_biogas_sh_route_switches(settings)
-    )
+    if csv_path is None or str(csv_path).strip() == "":
+        raise ValueError(
+            "args['biogas_sh']['csv_path'] must be set."
+        )
+
+    (
+        route_mode,
+        add_local_generation,
+        add_gas_grid_generation,
+        add_swfl_direct_supply,
+    ) = _resolve_biogas_sh_route_switches(settings)
 
     network = self.network
 
-    # -------------------------------------------------------------------------
-    # 2. Read Biogas.SH plant data and optionally map demand buses
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 2. Read plant data and map demand buses
+    # =========================================================================
     df = _read_biogas_sh_csv(csv_path)
 
-    if _as_bool(settings.get("auto_map_demand_buses", True), True):
-        df = _auto_map_demand_buses(self, df, settings)
+    if _as_bool(
+        settings.get("auto_map_demand_buses", True),
+        True,
+    ):
+        df = _auto_map_demand_buses(
+            self,
+            df,
+            settings,
+        )
 
     mapped_csv = settings.get("write_mapped_csv")
+
     if mapped_csv:
         mapped_csv = Path(mapped_csv).expanduser()
-        mapped_csv.parent.mkdir(parents=True, exist_ok=True)
-        df.to_csv(mapped_csv, index=False)
+        mapped_csv.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        df.to_csv(
+            mapped_csv,
+            index=False,
+        )
 
-    # -------------------------------------------------------------------------
-    # 3. Carrier setup
-    # -------------------------------------------------------------------------
-    # Use custom carriers by default. This avoids mixing custom Biogas.SH onsite
-    # generators with generic eGon biomass / CHP generators during clustering.
-    ac_only_carrier = settings.get("ac_only_carrier", "biogas_sh_onsite_el")
-    chp_el_carrier = settings.get("chp_el_carrier", "biogas_sh_onsite_chp_el")
-    chp_heat_carrier = settings.get("chp_heat_carrier", "biogas_sh_onsite_chp_heat")
+    # =========================================================================
+    # 3. Read carrier configuration
+    # =========================================================================
+    ac_only_carrier = str(
+        settings.get(
+            "ac_only_carrier",
+            "biogas_sh_onsite_el",
+        )
+    ).strip()
 
-    ch4_link_carrier = settings.get(
-        "ch4_link_carrier",
-        "biogas_sh_gas_grid_injection",
-    )
+    chp_el_carrier = str(
+        settings.get(
+            "chp_el_carrier",
+            "biogas_sh_onsite_chp_el",
+        )
+    ).strip()
+
+    chp_heat_carrier = str(
+        settings.get(
+            "chp_heat_carrier",
+            "biogas_sh_onsite_chp_heat",
+        )
+    ).strip()
+
+    ch4_link_carrier = str(
+        settings.get(
+            "ch4_link_carrier",
+            "biogas_sh_gas_grid_injection",
+        )
+    ).strip()
+
+    storage_cfg = _biogas_sh_storage_settings(settings)
+
+    storage_input_carrier = str(
+        storage_cfg.get(
+            "input_link_carrier",
+            "biogas_sh_collection_to_storage",
+        )
+    ).strip()
+
+    storage_grid_carrier = str(
+        storage_cfg.get(
+            "grid_link_carrier",
+            "biogas_sh_storage_to_grid",
+        )
+    ).strip()
+
+    storage_swfl_carrier = str(
+        storage_cfg.get(
+            "swfl_link_carrier",
+            "biogas_sh_storage_to_swfl",
+        )
+    ).strip()
 
     required_carriers = [
         ac_only_carrier,
@@ -1309,53 +2159,103 @@ def apply_biogas_sh_assets(self) -> None:
         ch4_link_carrier,
         "biogas_sh_swfl_direct",
         "biogas_sh_swfl_grid_supply",
-        "biogas_sh_storage_to_grid",
-        "biogas_sh_storage_to_swfl",
+        storage_input_carrier,
+        storage_grid_carrier,
+        storage_swfl_carrier,
     ]
 
     for carrier in required_carriers:
-        _ensure_carrier(network, carrier)
+        carrier = str(carrier).strip()
 
-    # -------------------------------------------------------------------------
-    # 4. Cost and topology settings
-    # -------------------------------------------------------------------------
-    el_mc = float(settings.get("electricity_marginal_cost", 42.1))
-    heat_mc = float(settings.get("heat_marginal_cost", 0.0))
-    default_biomethane_cost = float(settings.get("default_biomethane_cost", 75.0))
+        if not carrier:
+            raise ValueError(
+                "Biogas.SH carrier names must not be empty."
+            )
 
-    # Optional override from appl.py.
-    # If None: use plant-specific CSV value.
-    # If number: use this value for all Biogas.SH CH4_biogas generators.
+        _ensure_carrier(
+            network,
+            carrier,
+        )
+
+    # =========================================================================
+    # 4. Read cost and gas-topology settings
+    # =========================================================================
+    el_mc = float(
+        settings.get(
+            "electricity_marginal_cost",
+            42.1,
+        )
+    )
+
+    heat_mc = float(
+        settings.get(
+            "heat_marginal_cost",
+            0.0,
+        )
+    )
+
+    default_biomethane_cost = float(
+        settings.get(
+            "default_biomethane_cost",
+            75.0,
+        )
+    )
+
     biomethane_price_override = settings.get(
         "biomethane_price_override_eur_per_mwh",
         None,
     )
 
-    if biomethane_price_override is not None and not _is_missing(biomethane_price_override):
-        biomethane_price_override = float(biomethane_price_override)
+    if (
+        biomethane_price_override is not None
+        and not _is_missing(biomethane_price_override)
+    ):
+        biomethane_price_override = float(
+            biomethane_price_override
+        )
     else:
         biomethane_price_override = None
 
-    target_ch4_bus = _clean_id(settings.get("target_ch4_bus", "47538"))
-    gas_topology = str(settings.get("gas_topology", "producer_bus_link")).strip().lower()
+    target_ch4_bus = _clean_id(
+        settings.get(
+            "target_ch4_bus",
+            "47538",
+        )
+    )
 
-    if gas_topology not in {"direct_at_target", "producer_bus_link"}:
+    gas_topology = str(
+        settings.get(
+            "gas_topology",
+            "producer_bus_link",
+        )
+    ).strip().lower()
+
+    valid_gas_topologies = {
+        "direct_at_target",
+        "producer_bus_link",
+    }
+
+    if gas_topology not in valid_gas_topologies:
         raise ValueError(
-            "biogas_sh.gas_topology must be 'direct_at_target' or "
-            "'producer_bus_link'."
+            "biogas_sh.gas_topology must be "
+            "'direct_at_target' or 'producer_bus_link'."
         )
 
     if add_gas_grid_generation:
         if target_ch4_bus is None:
-            raise ValueError("biogas_sh.target_ch4_bus is missing.")
-        if target_ch4_bus not in network.buses.index:
             raise ValueError(
-                f"Biogas.SH target_ch4_bus {target_ch4_bus} not found in network.buses."
+                "biogas_sh.target_ch4_bus is missing."
             )
 
-    # -------------------------------------------------------------------------
-    # 5. Optional SWFL CH4 bus and public-grid supply access
-    # -------------------------------------------------------------------------
+        if target_ch4_bus not in network.buses.index:
+            raise ValueError(
+                f"Biogas.SH target_ch4_bus "
+                f"{target_ch4_bus!r} was not found in network.buses."
+            )
+
+    # =========================================================================
+    # 5. Ensure the SWFL natural-gas bus and public-grid access
+    # =========================================================================
     swfl_bus = None
     swfl_public_ch4_bus = None
     swfl_redirected_links = []
@@ -1367,23 +2267,51 @@ def apply_biogas_sh_assets(self) -> None:
             swfl_public_ch4_bus,
             swfl_redirected_links,
             swfl_grid_supply_added,
-        ) = _ensure_swfl_ch4_bus_and_access(network, settings)
-        
-        
-    # -------------------------------------------------------------------------
-    # Optional single Biogas.SH CH4 storage
-    # -------------------------------------------------------------------------
-    storage_cfg = _biogas_sh_storage_settings(settings)
-    use_biogas_sh_storage = _as_bool(storage_cfg.get("active", False), False)
+        ) = _ensure_swfl_ch4_bus_and_access(
+            network,
+            settings,
+        )
+
+    # =========================================================================
+    # 6. Add the optional central Biogas.SH storage
+    # =========================================================================
+    use_biogas_sh_storage = _as_bool(
+        storage_cfg.get(
+            "active",
+            False,
+        ),
+        False,
+    )
+
+    if (
+        use_biogas_sh_storage
+        and not (
+            add_gas_grid_generation
+            or add_swfl_direct_supply
+        )
+    ):
+        raise ValueError(
+            "Biogas.SH gas storage is active, but neither "
+            "add_gas_grid_generation nor add_swfl_direct_supply is active. "
+            "The storage would have no output route."
+        )
 
     storage_bus = None
     storage_added = False
 
     if use_biogas_sh_storage:
-        storage_bus, storage_added = _ensure_biogas_sh_single_storage(
-            network=network,
-            settings=settings,
+        storage_bus, storage_added = (
+            _ensure_biogas_sh_single_storage(
+                network=network,
+                settings=settings,
+            )
         )
+
+        if storage_bus is None:
+            raise RuntimeError(
+                "Biogas.SH storage is active, but no storage bus "
+                "was returned by _ensure_biogas_sh_single_storage()."
+            )
 
         _add_biogas_sh_storage_output_links(
             network=network,
@@ -1395,18 +2323,22 @@ def apply_biogas_sh_assets(self) -> None:
             swfl_bus=swfl_bus,
         )
 
-    # -------------------------------------------------------------------------
-    # 6. Counters and debug bookkeeping
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 7. Counters and debugging information
+    # =========================================================================
     added_el = 0
     added_heat = 0
     added_ch4 = 0
+
+    added_storage_input_links = 0
     added_grid_links = 0
     added_swfl_links = 0
 
     added_el_capacity = 0.0
     added_heat_capacity = 0.0
     added_ch4_capacity = 0.0
+
+    added_storage_input_capacity = 0.0
     added_grid_link_capacity = 0.0
     added_swfl_link_capacity = 0.0
 
@@ -1429,71 +2361,190 @@ def apply_biogas_sh_assets(self) -> None:
 
     skipped = []
 
-    # -------------------------------------------------------------------------
-    # 7. Add plant assets
-    # -------------------------------------------------------------------------
+    # Factors used for summary reporting.
+    storage_input_factor = float(
+        storage_cfg.get(
+            "input_link_p_nom_factor",
+            1.0,
+        )
+    )
+
+    grid_link_factor = float(
+        settings.get(
+            "ch4_link_p_nom_factor",
+            1.0,
+        )
+    )
+
+    swfl_cfg = _swfl_direct_settings(settings)
+
+    direct_swfl_factor = float(
+        swfl_cfg.get(
+            "direct_link_p_nom_factor",
+            1.0,
+        )
+    )
+
+    # =========================================================================
+    # 8. Add plant-specific assets
+    # =========================================================================
     for _, row in df.iterrows():
         debug_local["rows_total"] += 1
 
         plant_id = int(row["plant_id"])
         plant_name = str(row["plant_name"])
-        has_heat = _plant_has_heat(row, settings)
+        has_heat = _plant_has_heat(
+            row,
+            settings,
+        )
 
-        # ---------------------------------------------------------------------
-        # 7a. Local onsite electricity / heat route
-        # ---------------------------------------------------------------------
+        # =====================================================================
+        # 8a. Onsite electricity and heat generation
+        # =====================================================================
         if add_local_generation:
             debug_local["local_block_entered"] += 1
 
-            # Electricity generator
-            ac_bus = _clean_id(_safe_str(row, "ac_bus_for_model"))
-            p_nom_el = _get_electric_p_nom(row, settings)
-            potential_el_capacity += float(max(p_nom_el, 0.0))
+            # -----------------------------------------------------------------
+            # Onsite electricity generator
+            # -----------------------------------------------------------------
+            ac_bus = _clean_id(
+                _safe_str(
+                    row,
+                    "ac_bus_for_model",
+                )
+            )
+
+            p_nom_el = _get_electric_p_nom(
+                row,
+                settings,
+            )
+
+            potential_el_capacity += float(
+                max(
+                    p_nom_el,
+                    0.0,
+                )
+            )
 
             if ac_bus is None:
                 debug_local["ac_bus_missing"] += 1
-                skipped.append((plant_id, plant_name, "electricity_bus_missing", ac_bus))
+
+                skipped.append(
+                    (
+                        plant_id,
+                        plant_name,
+                        "electricity_bus_missing",
+                        ac_bus,
+                    )
+                )
 
             elif ac_bus not in network.buses.index:
                 debug_local["ac_bus_not_in_network"] += 1
-                skipped.append((plant_id, plant_name, "electricity_bus_not_in_network", ac_bus))
+
+                skipped.append(
+                    (
+                        plant_id,
+                        plant_name,
+                        "electricity_bus_not_in_network",
+                        ac_bus,
+                    )
+                )
 
             elif p_nom_el <= 0:
                 debug_local["p_nom_el_zero"] += 1
-                skipped.append((plant_id, plant_name, "electricity_p_nom_zero", p_nom_el))
+
+                skipped.append(
+                    (
+                        plant_id,
+                        plant_name,
+                        "electricity_p_nom_zero",
+                        p_nom_el,
+                    )
+                )
 
             else:
-                carrier = chp_el_carrier if has_heat else ac_only_carrier
+                electricity_carrier = (
+                    chp_el_carrier
+                    if has_heat
+                    else ac_only_carrier
+                )
+
                 _add_electricity_generator(
                     network=network,
                     plant_id=plant_id,
                     ac_bus=ac_bus,
-                    carrier=carrier,
+                    carrier=electricity_carrier,
                     p_nom=p_nom_el,
                     mc=el_mc,
                 )
-                added_el += 1
-                added_el_capacity += float(p_nom_el)
 
-            # Heat generator
+                added_el += 1
+                added_el_capacity += float(
+                    p_nom_el
+                )
+
+            # -----------------------------------------------------------------
+            # Onsite heat generator
+            # -----------------------------------------------------------------
             if has_heat:
                 debug_local["has_heat_true"] += 1
 
-                heat_bus = _clean_id(_safe_str(row, "heat_bus_for_model"))
-                p_nom_heat = _get_heat_p_nom(row, settings)
-                potential_heat_capacity += float(max(p_nom_heat, 0.0))
+                heat_bus = _clean_id(
+                    _safe_str(
+                        row,
+                        "heat_bus_for_model",
+                    )
+                )
+
+                p_nom_heat = _get_heat_p_nom(
+                    row,
+                    settings,
+                )
+
+                potential_heat_capacity += float(
+                    max(
+                        p_nom_heat,
+                        0.0,
+                    )
+                )
 
                 if heat_bus is None:
                     debug_local["heat_bus_missing"] += 1
-                    skipped.append((plant_id, plant_name, "heat_bus_missing", heat_bus))
+
+                    skipped.append(
+                        (
+                            plant_id,
+                            plant_name,
+                            "heat_bus_missing",
+                            heat_bus,
+                        )
+                    )
 
                 elif heat_bus not in network.buses.index:
-                    debug_local["heat_bus_not_in_network"] += 1
-                    skipped.append((plant_id, plant_name, "heat_bus_not_in_network", heat_bus))
+                    debug_local[
+                        "heat_bus_not_in_network"
+                    ] += 1
+
+                    skipped.append(
+                        (
+                            plant_id,
+                            plant_name,
+                            "heat_bus_not_in_network",
+                            heat_bus,
+                        )
+                    )
 
                 elif p_nom_heat <= 0:
                     debug_local["p_nom_heat_zero"] += 1
-                    skipped.append((plant_id, plant_name, "heat_p_nom_zero", p_nom_heat))
+
+                    skipped.append(
+                        (
+                            plant_id,
+                            plant_name,
+                            "heat_p_nom_zero",
+                            p_nom_heat,
+                        )
+                    )
 
                 else:
                     _add_heat_generator(
@@ -1504,177 +2555,572 @@ def apply_biogas_sh_assets(self) -> None:
                         p_nom=p_nom_heat,
                         mc=heat_mc,
                     )
+
                     added_heat += 1
-                    added_heat_capacity += float(p_nom_heat)
+                    added_heat_capacity += float(
+                        p_nom_heat
+                    )
 
-        # ---------------------------------------------------------------------
-        # 7b. Gas-grid and/or SWFL-direct CH4 route
-        # ---------------------------------------------------------------------
-        
-        # ---------------------------------------------------------------------
-        # 7b. Gas-grid and/or SWFL-direct CH4 route
-        # ---------------------------------------------------------------------
-        if add_gas_grid_generation or add_swfl_direct_supply:
-            p_nom_ch4 = _get_ch4_p_nom(row, settings)
-            potential_ch4_capacity += float(max(p_nom_ch4, 0.0))
+        # =====================================================================
+        # 8b. Biomethane production and gas routes
+        # =====================================================================
+        if not (
+            add_gas_grid_generation
+            or add_swfl_direct_supply
+        ):
+            continue
 
-            if biomethane_price_override is not None:
-                biomethane_cost = biomethane_price_override
-            else:
-                biomethane_cost = _safe_float(
-                    row,
-                    "biomethane_price_eur_per_mwh_hs_at_96pct",
-                    default=default_biomethane_cost,
+        p_nom_ch4 = _get_ch4_p_nom(
+            row,
+            settings,
+        )
+
+        potential_ch4_capacity += float(
+            max(
+                p_nom_ch4,
+                0.0,
+            )
+        )
+
+        if biomethane_price_override is not None:
+            biomethane_cost = (
+                biomethane_price_override
+            )
+        else:
+            biomethane_cost = _safe_float(
+                row,
+                "biomethane_price_eur_per_mwh_hs_at_96pct",
+                default=default_biomethane_cost,
+            )
+
+        if p_nom_ch4 <= 0:
+            debug_local["ch4_p_nom_zero"] += 1
+
+            skipped.append(
+                (
+                    plant_id,
+                    plant_name,
+                    "ch4_p_nom_zero",
+                    p_nom_ch4,
                 )
+            )
 
-            if p_nom_ch4 <= 0:
-                debug_local["ch4_p_nom_zero"] += 1
-                skipped.append((plant_id, plant_name, "ch4_p_nom_zero", p_nom_ch4))
-                continue
+            continue
 
-            # Direct-at-target topology should only be used when no Biogas.SH storage is active
-            if (
-                add_gas_grid_generation
-                and not add_swfl_direct_supply
-                and gas_topology == "direct_at_target"
-                and not use_biogas_sh_storage
-            ):
-                _add_ch4_generator_direct(
-                    network=network,
-                    plant_id=plant_id,
-                    ch4_bus=target_ch4_bus,
-                    p_nom=p_nom_ch4,
-                    mc=biomethane_cost,
-                )
-                added_ch4 += 1
-                added_ch4_capacity += float(p_nom_ch4)
-                continue
-            
-            # Plant-specific CH4 bus + CH4_biogas generator
-            plant_bus, _ = _ensure_plant_ch4_bus_and_generator(
+        # ---------------------------------------------------------------------
+        # Grid-only direct-at-target topology without central storage
+        # ---------------------------------------------------------------------
+        if (
+            add_gas_grid_generation
+            and not add_swfl_direct_supply
+            and gas_topology == "direct_at_target"
+            and not use_biogas_sh_storage
+        ):
+            _add_ch4_generator_direct(
+                network=network,
+                plant_id=plant_id,
+                ch4_bus=target_ch4_bus,
+                p_nom=p_nom_ch4,
+                mc=biomethane_cost,
+            )
+
+            added_ch4 += 1
+            added_ch4_capacity += float(
+                p_nom_ch4
+            )
+
+            continue
+
+        # ---------------------------------------------------------------------
+        # Plant-specific CH4 bus and biomethane generator
+        # ---------------------------------------------------------------------
+        plant_bus, _ = (
+            _ensure_plant_ch4_bus_and_generator(
                 network=network,
                 row=row,
                 plant_id=plant_id,
                 p_nom=p_nom_ch4,
                 mc=biomethane_cost,
             )
-            added_ch4 += 1
-            added_ch4_capacity += float(p_nom_ch4)
+        )
 
+        added_ch4 += 1
+        added_ch4_capacity += float(
+            p_nom_ch4
+        )
+
+        # ---------------------------------------------------------------------
+        # Central-storage topology
+        # ---------------------------------------------------------------------
         if use_biogas_sh_storage:
-            # New topology:
-            # plant CH4 bus -> one central Biogas.SH storage bus
-            #
-            # Downstream routes are already added once above:
-            # storage bus -> SWFL
-            # storage bus -> public CH4 grid
+            _add_ch4_storage_input_link_from_plant(
+                network=network,
+                plant_id=plant_id,
+                plant_bus=plant_bus,
+                storage_bus=storage_bus,
+                p_nom=p_nom_ch4,
+                settings=settings,
+            )
+
+            added_storage_input_links += 1
+
+            added_storage_input_capacity += float(
+                p_nom_ch4
+                * storage_input_factor
+            )
+
+            # With storage active, the plant is not connected directly to
+            # the public grid or directly to SWFL. Those routes start at
+            # the central storage bus.
+            continue
+
+        # ---------------------------------------------------------------------
+        # Direct plant-to-public-grid route
+        # ---------------------------------------------------------------------
+        if add_gas_grid_generation:
             _add_ch4_grid_link_from_plant(
                 network=network,
                 plant_id=plant_id,
                 plant_bus=plant_bus,
-                target_ch4_bus=storage_bus,
+                target_ch4_bus=target_ch4_bus,
                 p_nom=p_nom_ch4,
                 settings=settings,
             )
 
             added_grid_links += 1
+
             added_grid_link_capacity += float(
-            p_nom_ch4 * float(settings.get("ch4_link_p_nom_factor", 1.0))
+                p_nom_ch4
+                * grid_link_factor
             )
 
-        else:
-            # Original topology:
-            # plant CH4 bus -> public CH4 grid
-            if add_gas_grid_generation:
-                _add_ch4_grid_link_from_plant(
-                    network=network,
-                    plant_id=plant_id,
-                    plant_bus=plant_bus,
-                    target_ch4_bus=target_ch4_bus,
-                    p_nom=p_nom_ch4,
-                    settings=settings,
-                )
-                added_grid_links += 1
-                added_grid_link_capacity += float(
-                    p_nom_ch4 * float(settings.get("ch4_link_p_nom_factor", 1.0))
-                )
+        # ---------------------------------------------------------------------
+        # Direct plant-to-SWFL route
+        # ---------------------------------------------------------------------
+        if add_swfl_direct_supply:
+            _add_swfl_direct_link_from_plant(
+                network=network,
+                plant_id=plant_id,
+                plant_bus=plant_bus,
+                swfl_bus=swfl_bus,
+                p_nom=p_nom_ch4,
+                settings=settings,
+            )
 
-            # Original topology:
-            # plant CH4 bus -> SWFL CH4 bus
-            if add_swfl_direct_supply:
-                swfl_cfg = _swfl_direct_settings(settings)
-                _add_swfl_direct_link_from_plant(
-                    network=network,
-                    plant_id=plant_id,
-                    plant_bus=plant_bus,
-                    swfl_bus=swfl_bus,
-                    p_nom=p_nom_ch4,
-                    settings=settings,
-                )
-                added_swfl_links += 1
-                added_swfl_link_capacity += float(
-                    p_nom_ch4 * float(swfl_cfg.get("direct_link_p_nom_factor", 1.0))
-                )
-        
-        
-    # -------------------------------------------------------------------------
-    # 8. Summary output
-    # -------------------------------------------------------------------------
-    print("Biogas-SH assets added")
-    print(f"  scenario_mode:              {route_mode}")
-    print(f"  local generation:           {add_local_generation}")
-    print(f"  gas-grid injection:         {add_gas_grid_generation}")
-    print(f"  SWFL direct supply:         {add_swfl_direct_supply}")
-    print(f"  gas_topology:               {gas_topology}")
-    print(f"  target_ch4_bus:             {target_ch4_bus}")
-    
+            added_swfl_links += 1
+
+            added_swfl_link_capacity += float(
+                p_nom_ch4
+                * direct_swfl_factor
+            )
+
+    # =========================================================================
+    # 9. Summary
+    # =========================================================================
+    print("\nBiogas.SH assets added")
+
+    print(
+        f"  scenario mode:                    "
+        f"{route_mode}"
+    )
+    print(
+        f"  local generation active:          "
+        f"{add_local_generation}"
+    )
+    print(
+        f"  public grid route active:         "
+        f"{add_gas_grid_generation}"
+    )
+    print(
+        f"  SWFL supply route active:         "
+        f"{add_swfl_direct_supply}"
+    )
+    print(
+        f"  gas topology:                     "
+        f"{gas_topology}"
+    )
+    print(
+        f"  public target CH4 bus:            "
+        f"{target_ch4_bus}"
+    )
+
     if biomethane_price_override is not None:
-        print(f"  biomethane price override:  {biomethane_price_override:.2f} €/MWh_Hs")
+        print(
+            f"  biomethane price override:        "
+            f"{biomethane_price_override:.2f} €/MWh_Hs"
+        )
     else:
-        print("  biomethane price source:    CSV plant-specific values")
+        print(
+            "  biomethane price source:          "
+            "plant-specific CSV values"
+        )
 
-    print(f"  onsite AC-only carrier:     {ac_only_carrier}")
-    print(f"  onsite CHP-el carrier:      {chp_el_carrier}")
-    print(f"  onsite CHP-heat carrier:    {chp_heat_carrier}")
-    print(f"  gas-grid link carrier:      {ch4_link_carrier}")
+    print(
+        f"  onsite AC-only carrier:           "
+        f"{ac_only_carrier}"
+    )
+    print(
+        f"  onsite CHP-electric carrier:      "
+        f"{chp_el_carrier}"
+    )
+    print(
+        f"  onsite CHP-heat carrier:          "
+        f"{chp_heat_carrier}"
+    )
+    print(
+        f"  direct grid-link carrier:         "
+        f"{ch4_link_carrier}"
+    )
+    print(
+        f"  plant-to-storage carrier:         "
+        f"{storage_input_carrier}"
+    )
+    print(
+        f"  storage-to-grid carrier:          "
+        f"{storage_grid_carrier}"
+    )
+    print(
+        f"  storage-to-SWFL carrier:          "
+        f"{storage_swfl_carrier}"
+    )
 
     if add_swfl_direct_supply:
-        print(f"  swfl_ch4_bus:               {swfl_bus}")
-        print(f"  swfl_public_ch4_bus:        {swfl_public_ch4_bus}")
-        print(f"  redirected SWFL links:      {len(swfl_redirected_links)}")
-        print(f"  SWFL grid supply link:      {swfl_grid_supply_added}")
+        print(
+            f"  SWFL natural-gas bus:             "
+            f"{swfl_bus}"
+        )
+        print(
+            f"  SWFL public CH4 bus:              "
+            f"{swfl_public_ch4_bus}"
+        )
+        print(
+            f"  redirected old SWFL links:        "
+            f"{len(swfl_redirected_links)}"
+        )
+        print(
+            f"  public-grid-to-SWFL link added:   "
+            f"{swfl_grid_supply_added}"
+        )
 
-    print(f"  electricity generators:     {added_el}")
-    print(f"  heat generators:            {added_heat}")
-    print(f"  CH4_biogas generators:      {added_ch4}")
-    print(f"  gas-grid CH4 links:         {added_grid_links}")
-    print(f"  SWFL direct links:          {added_swfl_links}")
+    print(
+        f"  onsite electricity generators:    "
+        f"{added_el}"
+    )
+    print(
+        f"  onsite heat generators:           "
+        f"{added_heat}"
+    )
+    print(
+        f"  CH4_biogas generators:            "
+        f"{added_ch4}"
+    )
 
-    print(f"  electricity capacity MW:    {added_el_capacity:.6f}")
-    print(f"  heat capacity MW:           {added_heat_capacity:.6f}")
-    print(f"  CH4 capacity MW:            {added_ch4_capacity:.6f}")
-    print(f"  gas-grid link capacity MW:  {added_grid_link_capacity:.6f}")
-    print(f"  SWFL direct capacity MW:    {added_swfl_link_capacity:.6f}")
+    print(
+        f"  plant-to-storage links:           "
+        f"{added_storage_input_links}"
+    )
+    print(
+        f"  direct plant-to-grid links:       "
+        f"{added_grid_links}"
+    )
+    print(
+        f"  direct plant-to-SWFL links:       "
+        f"{added_swfl_links}"
+    )
 
-    print(f"  potential el capacity MW:   {potential_el_capacity:.6f}")
-    print(f"  potential heat capacity MW: {potential_heat_capacity:.6f}")
-    print(f"  potential CH4 capacity MW:  {potential_ch4_capacity:.6f}")
-    
-    print(f"  Biogas.SH storage active:   {use_biogas_sh_storage}")
+    print(
+        f"  onsite electricity capacity MW:   "
+        f"{added_el_capacity:.6f}"
+    )
+    print(
+        f"  onsite heat capacity MW:          "
+        f"{added_heat_capacity:.6f}"
+    )
+    print(
+        f"  biomethane capacity MW:           "
+        f"{added_ch4_capacity:.6f}"
+    )
+
+    print(
+        f"  plant-to-storage capacity MW:     "
+        f"{added_storage_input_capacity:.6f}"
+    )
+    print(
+        f"  direct grid-link capacity MW:     "
+        f"{added_grid_link_capacity:.6f}"
+    )
+    print(
+        f"  direct SWFL-link capacity MW:     "
+        f"{added_swfl_link_capacity:.6f}"
+    )
+
+    print(
+        f"  potential electricity cap. MW:    "
+        f"{potential_el_capacity:.6f}"
+    )
+    print(
+        f"  potential heat capacity MW:       "
+        f"{potential_heat_capacity:.6f}"
+    )
+    print(
+        f"  potential biomethane cap. MW:     "
+        f"{potential_ch4_capacity:.6f}"
+    )
+
+    print(
+        f"  central Biogas.SH storage active: "
+        f"{use_biogas_sh_storage}"
+    )
+
     if use_biogas_sh_storage:
-        print(f"  Biogas.SH storage bus:      {storage_bus}")
-        print(f"  Biogas.SH storage added:    {storage_added}")
-    
+        storage_swfl_target_bus = storage_cfg.get(
+            "swfl_target_bus",
+            swfl_bus,
+        )
 
-    print(f"  skipped components:         {len(skipped)}")
+        print(
+            f"  central storage bus:              "
+            f"{storage_bus}"
+        )
+        print(
+            f"  storage created or updated:       "
+            f"{storage_added}"
+        )
+        print(
+            f"  storage-to-grid route active:     "
+            f"{add_gas_grid_generation}"
+        )
+        print(
+            f"  storage-to-SWFL route active:     "
+            f"{add_swfl_direct_supply}"
+        )
+        print(
+            f"  storage SWFL target bus:          "
+            f"{storage_swfl_target_bus}"
+        )
+
+    print(
+        f"  skipped components:               "
+        f"{len(skipped)}"
+    )
 
     print("  local debug:")
-    for key, value in debug_local.items():
-        print(f"    {key}: {value}")
 
-    if skipped and _as_bool(settings.get("print_skipped_components", True), True):
+    for key, value in debug_local.items():
+        print(
+            f"    {key}: {value}"
+        )
+
+    if (
+        skipped
+        and _as_bool(
+            settings.get(
+                "print_skipped_components",
+                True,
+            ),
+            True,
+        )
+    ):
         print("  skipped details:")
-        for plant_id, plant_name, kind, value in skipped[:30]:
-            print(f"    plant {plant_id} ({plant_name}), {kind}, value={value}")
+
+        for (
+            plant_id,
+            plant_name,
+            kind,
+            value,
+        ) in skipped[:30]:
+            print(
+                f"    plant {plant_id} "
+                f"({plant_name}), "
+                f"{kind}, value={value}"
+            )
+
         if len(skipped) > 30:
-            print(f"    ... {len(skipped) - 30} more skipped components")
+            print(
+                f"    ... {len(skipped) - 30} "
+                "more skipped components"
+            )
+
+
+def validate_biogas_sh_storage_topology(
+    network,
+    args,
+) -> None:
+    """
+    Validate the Biogas.SH storage-to-SWFL biomethane connection
+    before network clustering.
+    """
+    biogas_cfg = args.get("biogas_sh", {}) or {}
+    storage_cfg = biogas_cfg.get("gas_storage", {}) or {}
+
+    if not storage_cfg.get("active", False):
+        print(
+            "\nBiogas.SH storage inactive; "
+            "storage topology validation skipped."
+        )
+        return
+
+    expected_link = str(
+        storage_cfg.get(
+            "swfl_link",
+            "biogas_sh_storage_to_swfl_biomethane",
+        )
+    )
+
+    expected_storage_bus = str(
+        storage_cfg.get(
+            "bus",
+            "biogas_sh_storage_ch4_bus",
+        )
+    )
+
+    expected_target_bus = str(
+        storage_cfg.get(
+            "swfl_target_bus",
+            "swfl_real_biomethane_ch4_bus",
+        )
+    )
+
+    expected_carrier = str(
+        storage_cfg.get(
+            "swfl_link_carrier",
+            "biogas_sh_storage_to_swfl",
+        )
+    )
+
+    print("\nBiogas.SH storage topology validation")
+    print(f"  expected link:       {expected_link}")
+    print(f"  expected source bus: {expected_storage_bus}")
+    print(f"  expected target bus: {expected_target_bus}")
+    print(f"  expected carrier:    {expected_carrier}")
+
+    if expected_storage_bus not in network.buses.index:
+        raise RuntimeError(
+            f"Storage bus {expected_storage_bus!r} "
+            "does not exist before clustering."
+        )
+
+    if expected_target_bus not in network.buses.index:
+        raise RuntimeError(
+            f"SWFL biomethane bus {expected_target_bus!r} "
+            "does not exist before clustering."
+        )
+
+    if expected_link not in network.links.index:
+        matching_links = network.links.loc[
+            (
+                network.links["bus0"].astype(str)
+                == expected_storage_bus
+            )
+            & (
+                network.links["bus1"].astype(str)
+                == expected_target_bus
+            )
+            & (
+                network.links["carrier"].astype(str)
+                == expected_carrier
+            )
+        ]
+
+        if matching_links.empty:
+            relevant_links = network.links.loc[
+                network.links["carrier"]
+                .astype(str)
+                .str.contains(
+                    "biogas_sh_storage",
+                    case=False,
+                    na=False,
+                ),
+                [
+                    "bus0",
+                    "bus1",
+                    "carrier",
+                    "p_nom",
+                ],
+            ]
+
+            raise RuntimeError(
+                f"Expected storage-to-SWFL link "
+                f"{expected_link!r} does not exist before clustering.\n"
+                f"Storage-related links found:\n"
+                f"{relevant_links}"
+            )
+
+        if len(matching_links) > 1:
+            raise RuntimeError(
+                "Multiple storage-to-SWFL links match the expected "
+                f"topology: {matching_links.index.astype(str).tolist()}"
+            )
+
+        actual_link = str(
+            matching_links.index[0]
+        )
+
+        logger.warning(
+            "Expected link name %s was not found, but equivalent "
+            "topology exists under link name %s.",
+            expected_link,
+            actual_link,
+        )
+
+    else:
+        actual_link = expected_link
+
+    link_data = network.links.loc[
+        actual_link,
+        [
+            "bus0",
+            "bus1",
+            "carrier",
+            "p_nom",
+        ],
+    ]
+
+    print("\n  located storage-to-SWFL link:")
+    print(link_data)
+
+    actual_bus0 = str(
+        network.links.at[
+            actual_link,
+            "bus0",
+        ]
+    )
+
+    actual_bus1 = str(
+        network.links.at[
+            actual_link,
+            "bus1",
+        ]
+    )
+
+    actual_carrier = str(
+        network.links.at[
+            actual_link,
+            "carrier",
+        ]
+    )
+
+    if actual_bus0 != expected_storage_bus:
+        raise RuntimeError(
+            f"Wrong storage-link source bus: "
+            f"{actual_bus0!r}; expected "
+            f"{expected_storage_bus!r}."
+        )
+
+    if actual_bus1 != expected_target_bus:
+        raise RuntimeError(
+            f"Wrong storage-link target bus: "
+            f"{actual_bus1!r}; expected "
+            f"{expected_target_bus!r}."
+        )
+
+    if actual_carrier != expected_carrier:
+        raise RuntimeError(
+            f"Wrong storage-link carrier: "
+            f"{actual_carrier!r}; expected "
+            f"{expected_carrier!r}."
+        )
+
+    print(
+        "\nBiogas.SH storage topology validation successful."
+    )

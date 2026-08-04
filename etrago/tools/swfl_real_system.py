@@ -62,97 +62,517 @@ logger = logging.getLogger(__name__)
 # Main public function
 # =============================================================================
 
+def resolve_biomethane_units(
+    cfg: Dict[str, Any],
+    available_boiler_names: Sequence[str],
+) -> Set[str]:
+    """
+    Return the boiler units allowed to use biomethane.
 
-def apply_swfl_real_system(network, settings: Optional[Dict[str, Any]] = None):
-    """Apply the real SWFL replacement system to a PyPSA network."""
+    Modes:
+        off
+        k12_k13_only
+        all_gas_units
+        custom
+    """
+
+    mode = str(
+        cfg.get(
+            "biomethane_mode",
+            "k12_k13_only",
+        )
+    ).strip().lower()
+
+    available = {
+        str(name)
+        for name in available_boiler_names
+    }
+
+    if mode == "off":
+        selected = set()
+
+    elif mode == "k12_k13_only":
+        selected = {
+            str(name)
+            for name in cfg.get(
+                "planned_biomethane_units",
+                [
+                    "swfl_real_k12",
+                    "swfl_real_k13",
+                ],
+            )
+        }
+
+    elif mode == "all_gas_units":
+        selected = set(available)
+
+    elif mode == "custom":
+        selected = {
+            str(name)
+            for name in cfg.get(
+                "custom_biomethane_units",
+                [],
+            )
+        }
+
+    else:
+        raise ValueError(
+            "Unsupported central_heat_units.biomethane_mode. "
+            "Use 'off', 'k12_k13_only', "
+            "'all_gas_units', or 'custom'."
+        )
+
+    unknown = selected - available
+
+    if unknown:
+        raise ValueError(
+            "Unknown biomethane boiler units: "
+            + ", ".join(sorted(unknown))
+        )
+
+    return selected
+
+def apply_swfl_real_system(
+    network,
+    settings: Optional[Dict[str, Any]] = None,
+):
+    """
+    Replace the generic eGon representation of the Flensburg/SWFL system
+    with project-specific loads and generation technologies.
+
+    The function performs the following steps:
+
+    1. Identify the Flensburg/SWFL replacement area.
+    2. Preserve the existing eGon AC-load profile shape.
+    3. Remove generic eGon loads, generators, and conversion technologies.
+    4. Create the project-specific SWFL buses.
+    5. Add the real heat-load profile.
+    6. Add the real-scaled AC-load profile.
+    7. Optionally add the aggregate 241 MWel electricity-generation link.
+    8. Optionally add the detailed central heat units:
+       K5, K11, K12, K13, EHK1, and EHK2.
+    9. Optionally add the reserve heating plant.
+    10. Optionally add future large heat pumps.
+
+    Important
+    ---------
+    When ``central_heat_units.active=True``, the aggregate 370 MWth link in
+    ``central_gas_chp`` must be disabled using:
+
+        central_gas_chp.add_heat_link = False
+
+    Otherwise, the same SWFL heat capacity would be represented twice.
+    """
     settings = settings or {}
 
+    # ------------------------------------------------------------------
+    # 0. Activation check
+    # ------------------------------------------------------------------
     if not _as_bool(settings.get("active", False), False):
-        logger.info("SWFL real system inactive; network unchanged.")
+        logger.info(
+            "SWFL real system inactive; network remains unchanged."
+        )
         return network
 
     _ensure_timeseries_tables(network)
+
     snapshots = pd.Index(network.snapshots)
 
-    # 1) Select Flensburg/SWFL area buses before removing anything.
-    area_buses = get_swfl_area_buses(network, settings)
+    # ------------------------------------------------------------------
+    # 1. Select the Flensburg/SWFL area before removing anything
+    # ------------------------------------------------------------------
+    area_buses = get_swfl_area_buses(
+        network=network,
+        settings=settings,
+    )
 
-    # 2) Build old eGon AC profile shape before deleting old loads.
+    # ------------------------------------------------------------------
+    # 2. Preserve the existing eGon AC-load profile shape
+    # ------------------------------------------------------------------
     ac_cfg = settings.get("ac_load", {}) or {}
+    ac_active = _as_bool(
+        ac_cfg.get("active", True),
+        True,
+    )
+
     ac_shape = None
-    if _as_bool(ac_cfg.get("active", True), True):
-        ac_shape = build_existing_ac_profile_shape(network, area_buses, ac_cfg)
 
-    # 3) Remove current eGon assets in the Flensburg/SWFL area.
-    if _as_bool(settings.get("remove_existing_flensburg_assets", True), True):
-        remove_existing_flensburg_assets(network, area_buses, settings)
+    if ac_active:
+        ac_shape = build_existing_ac_profile_shape(
+            network=network,
+            area_buses=area_buses,
+            cfg=ac_cfg,
+        )
 
-    # 4) Remove old eGon central/rural heat pumps if requested.
+    # ------------------------------------------------------------------
+    # 3. Remove generic eGon Flensburg/SWFL assets
+    # ------------------------------------------------------------------
+    if _as_bool(
+        settings.get(
+            "remove_existing_flensburg_assets",
+            True,
+        ),
+        True,
+    ):
+        remove_existing_flensburg_assets(
+            network=network,
+            area_buses=area_buses,
+            settings=settings,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Remove existing central/rural heat pumps if requested
+    # ------------------------------------------------------------------
     hp_cfg = settings.get("future_heat_pumps", {}) or {}
-    if _as_bool(hp_cfg.get("remove_existing_central_heat_pumps", True), True):
-        remove_existing_heat_pumps(network, area_buses, settings)
 
-    # 5) Ensure new SWFL buses.
-    swfl_ac_bus = str(settings.get("swfl_ac_bus", "swfl_ac_bus"))
-    swfl_heat_bus = str(settings.get("swfl_heat_bus", "swfl_central_heat_bus"))
-    swfl_ch4_bus = str(settings.get("swfl_ch4_bus", "biogas_sh_swfl_ch4_bus"))
+    if _as_bool(
+        hp_cfg.get(
+            "remove_existing_central_heat_pumps",
+            True,
+        ),
+        True,
+    ):
+        remove_existing_heat_pumps(
+            network=network,
+            area_buses=area_buses,
+            settings=settings,
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Create/update the main SWFL buses
+    # ------------------------------------------------------------------
+    swfl_ac_bus = str(
+        settings.get(
+            "swfl_ac_bus",
+            "swfl_ac_bus",
+        )
+    )
+
+    swfl_heat_bus = str(
+        settings.get(
+            "swfl_heat_bus",
+            "swfl_central_heat_bus",
+        )
+    )
+
+    swfl_ch4_bus = str(
+        settings.get(
+            "swfl_ch4_bus",
+            "biogas_sh_swfl_ch4_bus",
+        )
+    )
+
     x, y = get_swfl_coordinates(settings)
 
-    ensure_bus(network, swfl_ac_bus, carrier="AC", x=x, y=y)
-    ensure_bus(network, swfl_heat_bus, carrier=settings.get("heat_carrier", "central_heat"), x=x, y=y)
-    ensure_bus(network, swfl_ch4_bus, carrier="CH4", x=x, y=y)
+    ensure_bus(
+        network=network,
+        name=swfl_ac_bus,
+        carrier="AC",
+        x=x,
+        y=y,
+    )
 
-    # 6) Add real heat load.
+    ensure_bus(
+        network=network,
+        name=swfl_heat_bus,
+        carrier=str(
+            settings.get(
+                "heat_carrier",
+                "central_heat",
+            )
+        ),
+        x=x,
+        y=y,
+    )
+
+    ensure_bus(
+        network=network,
+        name=swfl_ch4_bus,
+        carrier="CH4",
+        x=x,
+        y=y,
+    )
+
+    # ------------------------------------------------------------------
+    # 6. Add the real SWFL heat load
+    # ------------------------------------------------------------------
     heat_cfg = settings.get("heat_load", {}) or {}
+    heat_active = _as_bool(
+        heat_cfg.get("active", True),
+        True,
+    )
+
     heat_profile = None
-    if _as_bool(heat_cfg.get("active", True), True):
-        heat_profile = read_heat_profile_for_snapshots(snapshots, heat_cfg)
+
+    if heat_active:
+        heat_profile = read_heat_profile_for_snapshots(
+            snapshots=snapshots,
+            cfg=heat_cfg,
+        )
+
         add_or_replace_load(
-            network,
-            name=str(heat_cfg.get("name", "swfl_real_heat_load")),
+            network=network,
+            name=str(
+                heat_cfg.get(
+                    "name",
+                    "swfl_real_heat_load",
+                )
+            ),
             bus=swfl_heat_bus,
-            carrier=str(heat_cfg.get("carrier", settings.get("heat_carrier", "central_heat"))),
+            carrier=str(
+                heat_cfg.get(
+                    "carrier",
+                    settings.get(
+                        "heat_carrier",
+                        "central_heat",
+                    ),
+                )
+            ),
             p_set=heat_profile,
         )
 
-    # 7) Add scaled AC load.
-    if _as_bool(ac_cfg.get("active", True), True):
-        ac_profile = scale_ac_profile_to_target(ac_shape, network, ac_cfg, snapshots)
+    # ------------------------------------------------------------------
+    # 7. Add the scaled SWFL AC load
+    # ------------------------------------------------------------------
+    if ac_active:
+        if ac_shape is None:
+            raise ValueError(
+                "SWFL AC-load configuration is active, but no existing "
+                "eGon AC profile shape was created."
+            )
+
+        ac_profile = scale_ac_profile_to_target(
+            profile=ac_shape,
+            network=network,
+            cfg=ac_cfg,
+            snapshots=snapshots,
+        )
+
         add_or_replace_load(
-            network,
-            name=str(ac_cfg.get("name", "swfl_real_ac_load")),
+            network=network,
+            name=str(
+                ac_cfg.get(
+                    "name",
+                    "swfl_real_ac_load",
+                )
+            ),
             bus=swfl_ac_bus,
-            carrier=str(ac_cfg.get("carrier", "AC")),
+            carrier=str(
+                ac_cfg.get(
+                    "carrier",
+                    "AC",
+                )
+            ),
             p_set=ac_profile,
         )
 
-    # 8) Add central gas CHP links.
-    chp_cfg = settings.get("central_gas_chp", {}) or {}
-    if _as_bool(chp_cfg.get("active", True), True):
+    # ------------------------------------------------------------------
+    # 8. Read central generation configurations
+    # ------------------------------------------------------------------
+    chp_cfg = settings.get(
+        "central_gas_chp",
+        {},
+    ) or {}
+
+    heat_units_cfg = settings.get(
+        "central_heat_units",
+        {},
+    ) or {}
+
+    chp_active = _as_bool(
+        chp_cfg.get("active", True),
+        True,
+    )
+
+    detailed_heat_active = _as_bool(
+        heat_units_cfg.get("active", False),
+        False,
+    )
+
+    aggregate_heat_active = (
+        chp_active
+        and _as_bool(
+            chp_cfg.get(
+                "add_heat_link",
+                True,
+            ),
+            True,
+        )
+    )
+
+    # Prevent double representation of the 370 MWth system.
+    if detailed_heat_active and aggregate_heat_active:
+        raise ValueError(
+            "Both the aggregate SWFL heat link and the detailed central "
+            "heat units are active. This would double-count SWFL heat "
+            "capacity. Set "
+            "args['swfl_real_system']['central_gas_chp']"
+            "['add_heat_link'] = False."
+        )
+
+    # ------------------------------------------------------------------
+    # 9. Add the aggregate SWFL electricity-generation link
+    # ------------------------------------------------------------------
+    # The temporary aggregate representation may retain the 241 MWel
+    # electricity side while its old 370 MWth heat side is disabled.
+    if chp_active:
         add_central_gas_chp_links(
-            network,
-            chp_cfg,
-            gas_bus=str(chp_cfg.get("gas_bus", swfl_ch4_bus)),
-            ac_bus=str(chp_cfg.get("ac_bus", swfl_ac_bus)),
-            heat_bus=str(chp_cfg.get("heat_bus", swfl_heat_bus)),
+            network=network,
+            cfg=chp_cfg,
+            gas_bus=str(
+                chp_cfg.get(
+                    "gas_bus",
+                    swfl_ch4_bus,
+                )
+            ),
+            ac_bus=str(
+                chp_cfg.get(
+                    "ac_bus",
+                    swfl_ac_bus,
+                )
+            ),
+            heat_bus=str(
+                chp_cfg.get(
+                    "heat_bus",
+                    swfl_heat_bus,
+                )
+            ),
         )
 
-    # 9) Optional reserve boiler.
-    boiler_cfg = settings.get("reserve_gas_boiler", {}) or {}
-    if _as_bool(boiler_cfg.get("active", False), False):
+    # ------------------------------------------------------------------
+    # 10. Add detailed SWFL central heat-generation units
+    # ------------------------------------------------------------------
+    if detailed_heat_active:
+        natural_gas_bus = str(
+            heat_units_cfg.get(
+                "natural_gas_bus",
+                swfl_ch4_bus,
+            )
+        )
+
+        biomethane_bus = str(
+            heat_units_cfg.get(
+                "biomethane_bus",
+                "swfl_real_biomethane_ch4_bus",
+            )
+        )
+
+        # The buses must remain separate so that natural gas and
+        # biomethane can be tracked independently.
+        if natural_gas_bus == biomethane_bus:
+            raise ValueError(
+                "central_heat_units.natural_gas_bus and "
+                "central_heat_units.biomethane_bus must be different. "
+                "Otherwise natural gas and biomethane cannot be "
+                "distinguished in the optimisation."
+            )
+
+        # The natural-gas bus should normally already be the main SWFL
+        # CH4 bus. Ensure it exists in case another bus was configured.
+        ensure_bus(
+            network=network,
+            name=natural_gas_bus,
+            carrier="CH4",
+            x=x,
+            y=y,
+        )
+
+        # Dedicated bus supplied from the Biogas.SH storage.
+        ensure_bus(
+            network=network,
+            name=biomethane_bus,
+            carrier="CH4",
+            x=x,
+            y=y,
+        )
+
+        add_central_heat_units(
+            network=network,
+            cfg=heat_units_cfg,
+            natural_gas_bus=natural_gas_bus,
+            biomethane_bus=biomethane_bus,
+            ac_bus=str(
+                heat_units_cfg.get(
+                    "ac_bus",
+                    swfl_ac_bus,
+                )
+            ),
+            heat_bus=str(
+                heat_units_cfg.get(
+                    "heat_bus",
+                    swfl_heat_bus,
+                )
+            ),
+            x=x,
+            y=y,
+        )
+
+    # ------------------------------------------------------------------
+    # 11. Add the optional 203 MWth reserve heating plant
+    # ------------------------------------------------------------------
+    reserve_cfg = settings.get(
+        "reserve_gas_boiler",
+        {},
+    ) or {}
+
+    if _as_bool(
+        reserve_cfg.get("active", False),
+        False,
+    ):
+        reserve_gas_bus = str(
+            reserve_cfg.get(
+                "gas_bus",
+                swfl_ch4_bus,
+            )
+        )
+
+        ensure_bus(
+            network=network,
+            name=reserve_gas_bus,
+            carrier="CH4",
+            x=x,
+            y=y,
+        )
+
         add_reserve_gas_boiler(
-            network,
-            boiler_cfg,
-            gas_bus=str(boiler_cfg.get("gas_bus", swfl_ch4_bus)),
-            heat_bus=str(boiler_cfg.get("heat_bus", swfl_heat_bus)),
+            network=network,
+            cfg=reserve_cfg,
+            gas_bus=reserve_gas_bus,
+            heat_bus=str(
+                reserve_cfg.get(
+                    "heat_bus",
+                    swfl_heat_bus,
+                )
+            ),
         )
 
-    # 10) Optional future heat pumps.
-    if _as_bool(hp_cfg.get("active", False), False):
-        add_future_heat_pumps(network, hp_cfg, ac_bus=swfl_ac_bus, heat_bus=swfl_heat_bus)
+    # ------------------------------------------------------------------
+    # 12. Add future large SWFL heat pumps
+    # ------------------------------------------------------------------
+    if _as_bool(
+        hp_cfg.get("active", False),
+        False,
+    ):
+        add_future_heat_pumps(
+            network=network,
+            cfg=hp_cfg,
+            ac_bus=swfl_ac_bus,
+            heat_bus=swfl_heat_bus,
+        )
 
-    print_swfl_real_system_summary(network, settings, area_buses, heat_profile, ac_shape)
+    # ------------------------------------------------------------------
+    # 13. Print summary and return the modified network
+    # ------------------------------------------------------------------
+    print_swfl_real_system_summary(
+        network=network,
+        settings=settings,
+        area_buses=area_buses,
+        heat_profile=heat_profile,
+        ac_shape=ac_shape,
+    )
+
     return network
+
 
 
 # =============================================================================
@@ -380,7 +800,7 @@ def expand_area_buses_through_local_links(
 
 def remove_existing_flensburg_assets(network, area_buses: Set[str], settings: Dict[str, Any]) -> None:
     """Remove existing eGon loads, generators, and selected links in SWFL area."""
-    protected_prefixes = tuple(settings.get("protected_prefixes", ["biogas_sh_", "swfl_real_"]))
+    protected_prefixes = tuple(settings.get("protected_prefixes", ["biogas_sh_", "swfl_real_", "swfl_gwp_"]))
     keep_components = {str(x) for x in settings.get("keep_components", [])}
 
     # Loads connected to area buses.
@@ -407,7 +827,7 @@ def remove_existing_flensburg_assets(network, area_buses: Set[str], settings: Di
     # unrelated transmission links just because one endpoint is in Flensburg.
     patterns = settings.get(
         "remove_link_carrier_patterns",
-        ["central_gas", "central_heat", "rural_heat", "heat_pump", "CHP", "boiler"],
+        ["central_gas", "central_heat", "rural_heat", "heat_pump", "CHP", "boiler", "central_resistive_heater"],
     )
     link_ids = component_indices_connected_to_buses(
         network.links,
@@ -420,23 +840,294 @@ def remove_existing_flensburg_assets(network, area_buses: Set[str], settings: Di
     remove_components(network, "Link", link_ids)
 
 
-def remove_existing_heat_pumps(network, area_buses: Set[str], settings: Dict[str, Any]) -> None:
-    """Remove old eGon heat-pump links in the SWFL area."""
-    protected_prefixes = tuple(settings.get("protected_prefixes", ["biogas_sh_", "swfl_real_"]))
-    keep_components = {str(x) for x in settings.get("keep_components", [])}
+def remove_existing_heat_pumps(
+    network,
+    area_buses: Set[str],
+    settings: Dict[str, Any],
+    remove_at_planned_connections: bool = False,
+) -> None:
+    """
+    Remove legacy eGon heat-pump Links relevant to the SWFL system.
+
+    Two modes are supported:
+
+    1. Before clustering:
+       Remove generic heat pumps connected to the selected SWFL area buses.
+
+    2. After spatial clustering:
+       Remove generic heat pumps that share the exact bus0/bus1 connection
+       of an active planned SWFL heat pump.
+
+    The second mode avoids removing heat pumps elsewhere in Germany.
+    """
+
+    protected_prefixes = tuple(
+        settings.get(
+            "protected_prefixes",
+            [
+                "biogas_sh_",
+                "swfl_real_",
+                "swfl_gwp_",
+            ],
+        )
+    )
+
+    keep_components = {
+        str(value)
+        for value in settings.get(
+            "keep_components",
+            [],
+        )
+    }
+
     patterns = settings.get(
         "remove_heat_pump_carrier_patterns",
-        ["central_heat_pump", "rural_heat_pump", "heat_pump"],
+        [
+            "central_heat_pump",
+            "rural_heat_pump",
+            "heat_pump",
+        ],
     )
-    ids = component_indices_connected_to_buses(
-        network.links,
-        bus_columns=link_bus_columns(network.links),
-        area_buses=area_buses,
-        protected_prefixes=protected_prefixes,
-        keep_components=keep_components,
-        carrier_patterns=patterns,
+
+    links = network.links
+
+    ids_to_remove: Set[str] = set()
+
+    # --------------------------------------------------------------
+    # A. Existing behaviour: remove heat pumps connected to SWFL area
+    # --------------------------------------------------------------
+    if area_buses:
+        area_ids = component_indices_connected_to_buses(
+            links,
+            bus_columns=link_bus_columns(links),
+            area_buses=area_buses,
+            protected_prefixes=protected_prefixes,
+            keep_components=keep_components,
+            carrier_patterns=patterns,
+        )
+
+        ids_to_remove.update(area_ids)
+
+    # --------------------------------------------------------------
+    # B. Post-clustering cleanup
+    # --------------------------------------------------------------
+    if remove_at_planned_connections:
+        hp_cfg = settings.get(
+            "future_heat_pumps",
+            {},
+        ) or {}
+
+        if not _as_bool(
+            hp_cfg.get("active", False),
+            False,
+        ):
+            print(
+                "\nLegacy heat-pump cleanup skipped: "
+                "planned SWFL heat pumps are inactive."
+            )
+
+        else:
+            units = hp_cfg.get(
+                "units",
+                [],
+            ) or []
+
+            configured_active_units = hp_cfg.get(
+                "active_units",
+                None,
+            )
+
+            if configured_active_units is not None:
+                active_names = {
+                    str(name)
+                    for name in configured_active_units
+                }
+            else:
+                active_names = {
+                    str(
+                        unit.get(
+                            "name",
+                            "",
+                        )
+                    ).strip()
+                    for unit in units
+                    if _as_bool(
+                        unit.get(
+                            "active",
+                            True,
+                        ),
+                        True,
+                    )
+                }
+
+            active_names.discard("")
+
+            planned_names = set()
+            planned_carriers = set()
+
+            for unit in units:
+                name = str(
+                    unit.get(
+                        "name",
+                        "",
+                    )
+                ).strip()
+
+                if not name or name not in active_names:
+                    continue
+
+                carrier = str(
+                    unit.get("carrier")
+                    or f"{name}_heat_pump"
+                )
+
+                planned_names.add(name)
+                planned_carriers.add(carrier)
+
+            link_names = links.index.astype(str)
+            link_carriers = links[
+                "carrier"
+            ].astype(str)
+
+            # Link names usually exist before clustering.
+            # Unique carriers remain usable after numeric renaming.
+            planned_mask = (
+                link_names.isin(planned_names)
+                | link_carriers.isin(
+                    planned_carriers
+                )
+            )
+
+            planned_links = links[
+                planned_mask
+            ]
+
+            if planned_links.empty:
+                raise ValueError(
+                    "No planned SWFL heat-pump Links were found "
+                    "during post-clustering legacy cleanup. "
+                    f"Expected carriers: "
+                    f"{sorted(planned_carriers)}"
+                )
+
+            if (
+                "bus0" not in planned_links.columns
+                or "bus1" not in planned_links.columns
+            ):
+                raise ValueError(
+                    "network.links must contain bus0 and bus1 "
+                    "for heat-pump cleanup."
+                )
+
+            planned_connections = {
+                (
+                    str(row["bus0"]),
+                    str(row["bus1"]),
+                )
+                for _, row in planned_links.iterrows()
+            }
+
+            generic_carrier_mask = pd.Series(
+                False,
+                index=links.index,
+            )
+
+            for pattern in patterns:
+                generic_carrier_mask |= (
+                    link_carriers.str.contains(
+                        str(pattern),
+                        case=False,
+                        regex=False,
+                        na=False,
+                    )
+                )
+
+            same_connection_mask = pd.Series(
+                [
+                    (
+                        str(row["bus0"]),
+                        str(row["bus1"]),
+                    )
+                    in planned_connections
+                    for _, row in links.iterrows()
+                ],
+                index=links.index,
+            )
+
+            protected_mask = pd.Series(
+                False,
+                index=links.index,
+            )
+
+            for prefix in protected_prefixes:
+                protected_mask |= (
+                    link_names.str.startswith(
+                        prefix
+                    )
+                )
+
+            if keep_components:
+                protected_mask |= (
+                    link_names.isin(
+                        keep_components
+                    )
+                )
+
+            # Planned Links may have numeric IDs after clustering,
+            # so protect them explicitly through their carriers.
+            protected_mask |= planned_mask
+
+            legacy_mask = (
+                generic_carrier_mask
+                & same_connection_mask
+                & ~protected_mask
+            )
+
+            legacy_ids = links.index[
+                legacy_mask
+            ].tolist()
+
+            if legacy_ids:
+                diagnostic_columns = [
+                    column
+                    for column in [
+                        "bus0",
+                        "bus1",
+                        "carrier",
+                        "p_nom",
+                        "p_nom_opt",
+                        "efficiency",
+                    ]
+                    if column in links.columns
+                ]
+
+                print(
+                    "\nRemoving legacy heat pumps at planned "
+                    "SWFL heat-pump connections:"
+                )
+
+                print(
+                    links.loc[
+                        legacy_ids,
+                        diagnostic_columns,
+                    ].to_string()
+                )
+
+                ids_to_remove.update(
+                    legacy_ids
+                )
+
+            else:
+                print(
+                    "\nNo legacy heat pump found at planned "
+                    "SWFL heat-pump connections."
+                )
+
+    remove_components(
+        network,
+        "Link",
+        list(ids_to_remove),
     )
-    remove_components(network, "Link", ids)
 
 
 def component_indices_connected_to_buses(
@@ -476,17 +1167,25 @@ def link_bus_columns(links: pd.DataFrame) -> List[str]:
     return [c for c in links.columns if c.startswith("bus")]
 
 
-def remove_components(network, component: str, names: Sequence[str]) -> None:
+def remove_components(
+    network,
+    component: str,
+    names: Sequence[Any],
+) -> None:
     """
     Remove PyPSA components safely.
 
-    PyPSA network.mremove() raises a KeyError if one of the requested names
-    does not exist. For this SWFL replacement module, we often call
-    remove_components() before adding/replacing components, so missing names
-    should simply be ignored.
+    Requested names are matched through their string representation, but the
+    original index values are passed to PyPSA. This supports both string IDs
+    and numeric IDs created by clustering.
     """
-    names = [str(n) for n in names if str(n)]
-    if not names:
+    requested_names = [
+        name
+        for name in names
+        if str(name)
+    ]
+
+    if not requested_names:
         return
 
     component_table = {
@@ -501,15 +1200,45 @@ def remove_components(network, component: str, names: Sequence[str]) -> None:
     }
 
     table_name = component_table.get(component)
-    if table_name is None or not hasattr(network, table_name):
-        logger.warning("Unknown PyPSA component type: %s", component)
+
+    if table_name is None or not hasattr(
+        network,
+        table_name,
+    ):
+        logger.warning(
+            "Unknown PyPSA component type: %s",
+            component,
+        )
         return
 
-    table = getattr(network, table_name)
-    existing_index = set(table.index.astype(str))
+    table = getattr(
+        network,
+        table_name,
+    )
 
-    existing_names = [n for n in names if n in existing_index]
-    missing_names = [n for n in names if n not in existing_index]
+    # Map string representations back to the actual index values.
+    index_lookup = {
+        str(index_value): index_value
+        for index_value in table.index
+    }
+
+    existing_names = []
+    missing_names = []
+
+    for requested_name in requested_names:
+        key = str(requested_name)
+
+        if key in index_lookup:
+            existing_names.append(
+                index_lookup[key]
+            )
+        else:
+            missing_names.append(key)
+
+    # Remove duplicates while preserving original index types.
+    existing_names = list(
+        dict.fromkeys(existing_names)
+    )
 
     if missing_names:
         logger.debug(
@@ -522,18 +1251,35 @@ def remove_components(network, component: str, names: Sequence[str]) -> None:
     if not existing_names:
         return
 
-    logger.info("Removing %d %s components", len(existing_names), component)
+    logger.info(
+        "Removing %d %s components: %s",
+        len(existing_names),
+        component,
+        [
+            str(name)
+            for name in existing_names[:10]
+        ],
+    )
 
     if hasattr(network, "mremove"):
-        network.mremove(component, existing_names)
+        network.mremove(
+            component,
+            existing_names,
+        )
     else:
         for name in existing_names:
             try:
-                network.remove(component, name)
+                network.remove(
+                    component,
+                    name,
+                )
             except Exception as exc:
-                logger.warning("Could not remove %s %s: %s", component, name, exc)
-
-
+                logger.warning(
+                    "Could not remove %s %s: %s",
+                    component,
+                    name,
+                    exc,
+                )
 # =============================================================================
 # Load profiles
 # =============================================================================
@@ -727,6 +1473,16 @@ def ensure_bus(network, name: str, carrier: str, x: float, y: float) -> None:
     network.add("Bus", name, carrier=carrier, x=x, y=y)
 
 
+def ensure_carrier(network, name: str) -> None:
+    """Add a PyPSA carrier if it does not already exist."""
+    name = str(name)
+
+    existing = set(network.carriers.index.astype(str))
+
+    if name not in existing:
+        network.add("Carrier", name)
+
+
 def add_or_replace_load(network, name: str, bus: str, carrier: str, p_set: pd.Series) -> None:
     remove_components(network, "Load", [name])
     network.add("Load", name, bus=bus, carrier=carrier)
@@ -734,56 +1490,777 @@ def add_or_replace_load(network, name: str, bus: str, carrier: str, p_set: pd.Se
     network.loads_t.p_set[name] = p_set.reindex(network.snapshots).astype(float).fillna(0.0)
 
 
-def add_central_gas_chp_links(network, cfg: Dict[str, Any], gas_bus: str, ac_bus: str, heat_bus: str) -> None:
+def add_central_gas_chp_links(
+    network,
+    cfg: Dict[str, Any],
+    gas_bus: str,
+    ac_bus: str,
+    heat_bus: str,
+) -> None:
     """
-    Add simple eGon-style central CHP links.
+    Add configurable aggregate SWFL gas-to-power and gas-to-heat links.
 
-    Note: this is not yet a physically coupled CHP. Electricity and heat are
-    separate links. A heat-to-power coupling constraint can be added later.
+    The electrical link can be retained while the aggregate heat link is
+    disabled and replaced by the detailed boiler/EHK representation.
+
+    This is still not a physically coupled CHP representation.
     """
-    p_nom_is_output = _as_bool(cfg.get("p_nom_is_output_capacity", True), True)
 
-    el_name = str(cfg.get("electric_link_name", "swfl_real_central_gas_CHP"))
-    heat_name = str(cfg.get("heat_link_name", "swfl_real_central_gas_CHP_heat"))
-
-    el_cap = float(cfg.get("electric_capacity_mw", 241.0))
-    heat_cap = float(cfg.get("heat_capacity_mw", 370.0))
-    el_eff = float(cfg.get("electric_efficiency", 1.0))
-    heat_eff = float(cfg.get("heat_efficiency", 1.0))
-
-    el_p_nom = el_cap / el_eff if p_nom_is_output and el_eff else el_cap
-    heat_p_nom = heat_cap / heat_eff if p_nom_is_output and heat_eff else heat_cap
-
-    remove_components(network, "Link", [el_name, heat_name])
-
-    network.add(
-        "Link",
-        el_name,
-        bus0=gas_bus,
-        bus1=ac_bus,
-        carrier=str(cfg.get("carrier_el", "central_gas_CHP")),
-        p_nom=el_p_nom,
-        p_nom_extendable=_as_bool(cfg.get("extendable", False), False),
-        p_min_pu=float(cfg.get("p_min_pu", 0.0)),
-        p_max_pu=float(cfg.get("p_max_pu", 1.0)),
-        efficiency=el_eff,
-        marginal_cost=float(cfg.get("electric_marginal_cost", cfg.get("marginal_cost", 0.0))),
-        capital_cost=float(cfg.get("electric_capital_cost", cfg.get("capital_cost", 0.0))),
+    add_electric_link = _as_bool(
+        cfg.get("add_electric_link", True),
+        True,
     )
 
-    network.add(
+    add_heat_link = _as_bool(
+        cfg.get("add_heat_link", True),
+        True,
+    )
+
+    p_nom_is_output = _as_bool(
+        cfg.get("p_nom_is_output_capacity", True),
+        True,
+    )
+
+    el_name = str(
+        cfg.get(
+            "electric_link_name",
+            "swfl_real_central_gas_CHP",
+        )
+    )
+
+    heat_name = str(
+        cfg.get(
+            "heat_link_name",
+            "swfl_real_central_gas_CHP_heat",
+        )
+    )
+
+    # Always remove previous versions before rebuilding.
+    remove_components(
+        network,
         "Link",
-        heat_name,
-        bus0=gas_bus,
-        bus1=heat_bus,
-        carrier=str(cfg.get("carrier_heat", "central_gas_CHP_heat")),
-        p_nom=heat_p_nom,
-        p_nom_extendable=_as_bool(cfg.get("extendable", False), False),
-        p_min_pu=float(cfg.get("p_min_pu", 0.0)),
-        p_max_pu=float(cfg.get("p_max_pu", 1.0)),
-        efficiency=heat_eff,
-        marginal_cost=float(cfg.get("heat_marginal_cost", cfg.get("marginal_cost", 0.0))),
-        capital_cost=float(cfg.get("heat_capital_cost", cfg.get("capital_cost", 0.0))),
+        [el_name, heat_name],
+    )
+
+    # ------------------------------------------------------------------
+    # Aggregated electricity-generation link
+    # ------------------------------------------------------------------
+    if add_electric_link:
+        el_cap = float(
+            cfg.get(
+                "electric_capacity_mw",
+                241.0,
+            )
+        )
+
+        el_eff = float(
+            cfg.get(
+                "electric_efficiency",
+                0.40,
+            )
+        )
+
+        if el_eff <= 0:
+            raise ValueError(
+                "central_gas_chp.electric_efficiency must be greater than zero."
+            )
+
+        # PyPSA Link p_nom is on the bus0/input side.
+        el_p_nom = (
+            el_cap / el_eff
+            if p_nom_is_output
+            else el_cap
+        )
+
+        el_carrier = str(
+            cfg.get(
+                "carrier_el",
+                "swfl_real_gas_to_power",
+            )
+        )
+
+        ensure_carrier(network, el_carrier)
+
+        network.add(
+            "Link",
+            el_name,
+            bus0=gas_bus,
+            bus1=ac_bus,
+            carrier=el_carrier,
+            p_nom=el_p_nom,
+            p_nom_extendable=_as_bool(
+                cfg.get("extendable", False),
+                False,
+            ),
+            p_min_pu=float(
+                cfg.get("p_min_pu", 0.0)
+            ),
+            p_max_pu=float(
+                cfg.get("p_max_pu", 1.0)
+            ),
+            efficiency=el_eff,
+            marginal_cost=float(
+                cfg.get(
+                    "electric_marginal_cost",
+                    cfg.get("marginal_cost", 0.0),
+                )
+            ),
+            capital_cost=float(
+                cfg.get(
+                    "electric_capital_cost",
+                    cfg.get("capital_cost", 0.0),
+                )
+            ),
+        )
+
+    # ------------------------------------------------------------------
+    # Optional aggregate heat link
+    # ------------------------------------------------------------------
+    # For the new detailed SWFL unit representation this must be False.
+    if add_heat_link:
+        heat_cap = float(
+            cfg.get(
+                "heat_capacity_mw",
+                370.0,
+            )
+        )
+
+        heat_eff = float(
+            cfg.get(
+                "heat_efficiency",
+                0.90,
+            )
+        )
+
+        if heat_eff <= 0:
+            raise ValueError(
+                "central_gas_chp.heat_efficiency must be greater than zero."
+            )
+
+        heat_p_nom = (
+            heat_cap / heat_eff
+            if p_nom_is_output
+            else heat_cap
+        )
+
+        heat_carrier = str(
+            cfg.get(
+                "carrier_heat",
+                "swfl_real_gas_to_heat",
+            )
+        )
+
+        ensure_carrier(network, heat_carrier)
+
+        network.add(
+            "Link",
+            heat_name,
+            bus0=gas_bus,
+            bus1=heat_bus,
+            carrier=heat_carrier,
+            p_nom=heat_p_nom,
+            p_nom_extendable=_as_bool(
+                cfg.get("extendable", False),
+                False,
+            ),
+            p_min_pu=float(
+                cfg.get("p_min_pu", 0.0)
+            ),
+            p_max_pu=float(
+                cfg.get("p_max_pu", 1.0)
+            ),
+            efficiency=heat_eff,
+            marginal_cost=float(
+                cfg.get(
+                    "heat_marginal_cost",
+                    cfg.get("marginal_cost", 0.0),
+                )
+            ),
+            capital_cost=float(
+                cfg.get(
+                    "heat_capital_cost",
+                    cfg.get("capital_cost", 0.0),
+                )
+            ),
+        )
+
+def add_central_heat_units(
+    network,
+    cfg: Dict[str, Any],
+    natural_gas_bus: str,
+    biomethane_bus: str,
+    ac_bus: str,
+    heat_bus: str,
+    x: float,
+    y: float,
+) -> None:
+    """
+    Add detailed SWFL central heat-generation units.
+
+    Fuel-fired units:
+        K5   60 MWth
+        K11  70 MWth
+        K12  80 MWth
+        K13  90 MWth
+
+    Electric units:
+        EHK1 30 MWth
+        EHK2 40 MWth
+
+    Every fuel-fired boiler receives one internal fuel bus and one conversion
+    link. Natural gas, biomethane and optional HEL supply this internal bus.
+
+    This ensures that multiple fuels share the same physical boiler capacity.
+    """
+
+    if natural_gas_bus not in network.buses.index.astype(str):
+        raise ValueError(
+            f"Natural-gas bus {natural_gas_bus!r} "
+            "does not exist in network.buses."
+        )
+
+    if heat_bus not in network.buses.index.astype(str):
+        raise ValueError(
+            f"SWFL heat bus {heat_bus!r} "
+            "does not exist in network.buses."
+        )
+
+    if ac_bus not in network.buses.index.astype(str):
+        raise ValueError(
+            f"SWFL AC bus {ac_bus!r} "
+            "does not exist in network.buses."
+        )
+
+    ensure_bus(
+        network,
+        biomethane_bus,
+        carrier="CH4",
+        x=x,
+        y=y,
+    )
+
+    ensure_carrier(
+        network,
+        "swfl_real_boiler_fuel",
+    )
+
+    boilers = cfg.get("boilers", []) or []
+    resistive_heaters = cfg.get("resistive_heaters", []) or []
+
+    boiler_names = [
+        str(unit.get("name", "")).strip()
+        for unit in boilers
+        if str(unit.get("name", "")).strip()
+    ]
+
+    biomethane_units = resolve_biomethane_units(
+        cfg,
+        boiler_names,
+    )
+
+    allow_hel_backup = _as_bool(
+        cfg.get("allow_hel_backup", False),
+        False,
+    )
+
+    # ------------------------------------------------------------------
+    # Optional HEL supply
+    # ------------------------------------------------------------------
+    hel_bus = str(
+        cfg.get(
+            "hel_bus",
+            "swfl_real_hel_bus",
+        )
+    )
+
+    hel_generator = str(
+        cfg.get(
+            "hel_supply_generator",
+            "swfl_real_hel_supply",
+        )
+    )
+
+    remove_components(
+        network,
+        "Generator",
+        [hel_generator],
+    )
+
+    if allow_hel_backup:
+        ensure_bus(
+            network,
+            hel_bus,
+            carrier="heating_oil",
+            x=x,
+            y=y,
+        )
+
+        ensure_carrier(
+            network,
+            "heating_oil",
+        )
+
+        network.add(
+            "Generator",
+            hel_generator,
+            bus=hel_bus,
+            carrier="heating_oil",
+            p_nom=float(
+                cfg.get(
+                    "hel_supply_p_nom_mw",
+                    1.0e6,
+                )
+            ),
+            p_nom_extendable=False,
+            p_min_pu=0.0,
+            p_max_pu=1.0,
+            marginal_cost=float(
+                cfg.get(
+                    "hel_marginal_cost",
+                    0.0,
+                )
+            ),
+            capital_cost=0.0,
+        )
+
+    # ------------------------------------------------------------------
+    # Helper for fuel-supply links
+    # ------------------------------------------------------------------
+    def add_fuel_supply_link(
+        name: str,
+        source_bus: str,
+        target_bus: str,
+        p_nom: float,
+        carrier: str,
+        marginal_cost: float = 0.0,
+    ) -> None:
+        ensure_carrier(
+            network,
+            carrier,
+        )
+
+        remove_components(
+            network,
+            "Link",
+            [name],
+        )
+
+        network.add(
+            "Link",
+            name,
+            bus0=source_bus,
+            bus1=target_bus,
+            carrier=carrier,
+            p_nom=p_nom,
+            p_nom_extendable=False,
+            p_min_pu=0.0,
+            p_max_pu=1.0,
+            efficiency=1.0,
+            marginal_cost=marginal_cost,
+            capital_cost=0.0,
+        )
+
+    total_boiler_heat_capacity = 0.0
+
+    # ------------------------------------------------------------------
+    # Fuel-fired boiler units
+    # ------------------------------------------------------------------
+    for unit in boilers:
+        name = str(
+            unit.get("name", "")
+        ).strip()
+
+        if not name:
+            raise ValueError(
+                "Each central heat boiler needs a name."
+            )
+
+        unit_active = _as_bool(
+            unit.get("active", True),
+            True,
+        )
+
+        fuel_bus = str(
+            unit.get(
+                "fuel_bus",
+                f"{name}_fuel_bus",
+            )
+        )
+
+        boiler_link = str(
+            unit.get(
+                "heat_link_name",
+                f"{name}_to_heat",
+            )
+        )
+
+        natural_gas_link = (
+            f"{name}_natural_gas_supply"
+        )
+
+        biomethane_link = (
+            f"{name}_biomethane_supply"
+        )
+
+        hel_link = (
+            f"{name}_hel_supply"
+        )
+
+        # Remove stale components, especially when switching scenarios.
+        remove_components(
+            network,
+            "Link",
+            [
+                boiler_link,
+                natural_gas_link,
+                biomethane_link,
+                hel_link,
+            ],
+        )
+
+        if not unit_active:
+            continue
+
+        heat_capacity = float(
+            unit.get(
+                "heat_capacity_mw",
+                0.0,
+            )
+        )
+
+        efficiency = float(
+            unit.get(
+                "efficiency",
+                cfg.get(
+                    "default_boiler_efficiency",
+                    0.90,
+                ),
+            )
+        )
+
+        if heat_capacity <= 0:
+            raise ValueError(
+                f"Boiler {name} has invalid heat capacity "
+                f"{heat_capacity} MW."
+            )
+
+        if efficiency <= 0:
+            raise ValueError(
+                f"Boiler {name} has invalid efficiency "
+                f"{efficiency}."
+            )
+
+        fuel_input_capacity = (
+            heat_capacity / efficiency
+        )
+
+        ensure_bus(
+            network,
+            fuel_bus,
+            carrier="swfl_real_boiler_fuel",
+            x=x,
+            y=y,
+        )
+
+        base_fuels = {
+            str(fuel).strip().lower()
+            for fuel in unit.get(
+                "base_fuels",
+                ["natural_gas"],
+            )
+        }
+
+        # Natural gas supply
+        if "natural_gas" in base_fuels:
+            add_fuel_supply_link(
+                name=natural_gas_link,
+                source_bus=natural_gas_bus,
+                target_bus=fuel_bus,
+                p_nom=fuel_input_capacity,
+                carrier="swfl_real_natural_gas_to_boiler",
+                marginal_cost=float(
+                    unit.get(
+                        "natural_gas_transport_cost",
+                        0.0,
+                    )
+                ),
+            )
+
+        # Biomethane supply
+        if name in biomethane_units:
+            add_fuel_supply_link(
+                name=biomethane_link,
+                source_bus=biomethane_bus,
+                target_bus=fuel_bus,
+                p_nom=fuel_input_capacity,
+                carrier="swfl_real_biomethane_to_boiler",
+                marginal_cost=float(
+                    unit.get(
+                        "biomethane_transport_cost",
+                        0.0,
+                    )
+                ),
+            )
+
+        # Optional HEL supply, normally only relevant for K5
+        optional_fuels = {
+            str(fuel).strip().lower()
+            for fuel in unit.get(
+                "optional_fuels",
+                [],
+            )
+        }
+
+        if allow_hel_backup and "hel" in optional_fuels:
+            add_fuel_supply_link(
+                name=hel_link,
+                source_bus=hel_bus,
+                target_bus=fuel_bus,
+                p_nom=fuel_input_capacity,
+                carrier="swfl_real_hel_to_boiler",
+                marginal_cost=0.0,
+            )
+
+        boiler_carrier = str(
+            unit.get(
+                "carrier",
+                "central_gas_boiler",
+            )
+        )
+
+        ensure_carrier(
+            network,
+            boiler_carrier,
+        )
+
+        network.add(
+            "Link",
+            boiler_link,
+            bus0=fuel_bus,
+            bus1=heat_bus,
+            carrier=boiler_carrier,
+
+            # PyPSA Link p_nom is fuel-input capacity.
+            p_nom=fuel_input_capacity,
+
+            p_nom_extendable=_as_bool(
+                unit.get("extendable", False),
+                False,
+            ),
+            p_min_pu=float(
+                unit.get("p_min_pu", 0.0)
+            ),
+            p_max_pu=float(
+                unit.get("p_max_pu", 1.0)
+            ),
+            efficiency=efficiency,
+
+            # Fuel price is represented upstream.
+            # This value represents variable non-fuel O&M only.
+            marginal_cost=float(
+                unit.get("marginal_cost", 0.0)
+            ),
+            capital_cost=float(
+                unit.get("capital_cost", 0.0)
+            ),
+        )
+
+        # Metadata for reporting
+        try:
+            network.links.loc[
+                boiler_link,
+                "heat_capacity_mw",
+            ] = heat_capacity
+
+            network.links.loc[
+                boiler_link,
+                "boiler_efficiency",
+            ] = efficiency
+        except Exception:
+            pass
+
+        total_boiler_heat_capacity += heat_capacity
+
+    # ------------------------------------------------------------------
+    # Electrode boilers
+    # ------------------------------------------------------------------
+    total_resistive_heat_capacity = 0.0
+
+    for unit in resistive_heaters:
+        name = str(
+            unit.get("name", "")
+        ).strip()
+
+        if not name:
+            raise ValueError(
+                "Each resistive heater needs a name."
+            )
+
+        remove_components(
+            network,
+            "Link",
+            [name],
+        )
+
+        if not _as_bool(
+            unit.get("active", True),
+            True,
+        ):
+            continue
+
+        heat_capacity = float(
+            unit.get(
+                "heat_capacity_mw",
+                0.0,
+            )
+        )
+
+        efficiency = float(
+            unit.get(
+                "efficiency",
+                cfg.get(
+                    "default_resistive_efficiency",
+                    0.99,
+                ),
+            )
+        )
+
+        if heat_capacity <= 0:
+            raise ValueError(
+                f"Resistive heater {name} has invalid "
+                f"heat capacity {heat_capacity} MW."
+            )
+
+        if efficiency <= 0:
+            raise ValueError(
+                f"Resistive heater {name} has invalid "
+                f"efficiency {efficiency}."
+            )
+
+        electric_input_capacity = (
+            heat_capacity / efficiency
+        )
+
+        carrier = str(
+            unit.get(
+                "carrier",
+                "central_resistive_heater",
+            )
+        )
+
+        ensure_carrier(
+            network,
+            carrier,
+        )
+
+        network.add(
+            "Link",
+            name,
+            bus0=str(
+                unit.get(
+                    "ac_bus",
+                    ac_bus,
+                )
+            ),
+            bus1=str(
+                unit.get(
+                    "heat_bus",
+                    heat_bus,
+                )
+            ),
+            carrier=carrier,
+            p_nom=electric_input_capacity,
+            p_nom_extendable=_as_bool(
+                unit.get("extendable", False),
+                False,
+            ),
+            p_min_pu=float(
+                unit.get("p_min_pu", 0.0)
+            ),
+            p_max_pu=float(
+                unit.get("p_max_pu", 1.0)
+            ),
+            efficiency=efficiency,
+            marginal_cost=float(
+                unit.get("marginal_cost", 0.0)
+            ),
+            capital_cost=float(
+                unit.get("capital_cost", 0.0)
+            ),
+        )
+
+        try:
+            network.links.loc[
+                name,
+                "heat_capacity_mw",
+            ] = heat_capacity
+        except Exception:
+            pass
+
+        total_resistive_heat_capacity += heat_capacity
+
+    # ------------------------------------------------------------------
+    # Capacity validation
+    # ------------------------------------------------------------------
+    total_heat_capacity = (
+        total_boiler_heat_capacity
+        + total_resistive_heat_capacity
+    )
+
+    expected_capacity = float(
+        cfg.get(
+            "expected_total_heat_capacity_mw",
+            370.0,
+        )
+    )
+
+    tolerance = float(
+        cfg.get(
+            "capacity_validation_tolerance_mw",
+            1.0e-6,
+        )
+    )
+
+    if abs(total_heat_capacity - expected_capacity) > tolerance:
+        logger.warning(
+            "SWFL central heat capacity is %.3f MW, "
+            "but expected %.3f MW.",
+            total_heat_capacity,
+            expected_capacity,
+        )
+
+    biomethane_capacity = sum(
+        float(unit.get("heat_capacity_mw", 0.0))
+        for unit in boilers
+        if str(unit.get("name", "")).strip()
+        in biomethane_units
+        and _as_bool(unit.get("active", True), True)
+    )
+
+    print("\nSWFL detailed central heat units added")
+    print(
+        f"  boiler heat capacity MW:      "
+        f"{total_boiler_heat_capacity:.3f}"
+    )
+    print(
+        f"  resistive heat capacity MW:   "
+        f"{total_resistive_heat_capacity:.3f}"
+    )
+    print(
+        f"  total heat capacity MW:       "
+        f"{total_heat_capacity:.3f}"
+    )
+    print(
+        f"  biomethane-enabled units:     "
+        f"{sorted(biomethane_units) if biomethane_units else 'none'}"
+    )
+    print(
+        f"  biomethane heat capacity MW:  "
+        f"{biomethane_capacity:.3f}"
+    )
+    print(
+        f"  HEL backup active:            "
+        f"{allow_hel_backup}"
     )
 
 
@@ -811,60 +2288,362 @@ def add_reserve_gas_boiler(network, cfg: Dict[str, Any], gas_bus: str, heat_bus:
     )
 
 
-def add_future_heat_pumps(network, cfg: Dict[str, Any], ac_bus: str, heat_bus: str) -> None:
-    """Add future heat pumps; each unit can be activated individually."""
+def add_future_heat_pumps(
+    network,
+    cfg: Dict[str, Any],
+    ac_bus: str,
+    heat_bus: str,
+) -> None:
+    """
+    Add future SWFL heat pumps; each unit can be activated individually.
+
+    Each planned unit receives its own carrier by default. This is important
+    because eTraGo may aggregate Links that have the same carrier and clustered
+    endpoint buses. Separate carriers preserve GWP 1 and GWP 2 as distinct
+    Links and prevent them from being merged with generic eGon heat pumps.
+    """
     units = cfg.get("units", []) or []
     active_units = cfg.get("active_units", None)
-    active_units_set = {str(x) for x in active_units} if active_units is not None else None
+
+    active_units_set = (
+        {str(value) for value in active_units}
+        if active_units is not None
+        else None
+    )
 
     for unit in units:
         name = str(unit.get("name", "")).strip()
+
         if not name:
-            raise ValueError("Each future heat pump unit needs a name.")
+            raise ValueError(
+                "Each future heat-pump unit needs a name."
+            )
 
         if active_units_set is not None:
             unit_active = name in active_units_set
         else:
-            unit_active = _as_bool(unit.get("active", True), True)
+            unit_active = _as_bool(
+                unit.get("active", True),
+                True,
+            )
 
         if not unit_active:
-            remove_components(network, "Link", [name])
+            remove_components(
+                network,
+                "Link",
+                [name],
+            )
             continue
 
-        heat_capacity = float(unit.get("heat_capacity_mw", 60.0))
-        cop = float(unit.get("cop", cfg.get("default_cop", 3.0)))
-        if cop <= 0:
-            raise ValueError(f"Heat pump {name} has invalid COP {cop}.")
+        heat_capacity = float(
+            unit.get(
+                "heat_capacity_mw",
+                60.0,
+            )
+        )
 
-        # PyPSA Link p_nom is input-side electric capacity; heat output = p0 * COP.
+        cop = float(
+            unit.get(
+                "cop",
+                cfg.get("default_cop", 3.0),
+            )
+        )
+
+        if heat_capacity <= 0:
+            raise ValueError(
+                f"Heat pump {name} has invalid heat capacity "
+                f"{heat_capacity} MWth."
+            )
+
+        if cop <= 0:
+            raise ValueError(
+                f"Heat pump {name} has invalid COP {cop}."
+            )
+
+        # PyPSA Link p_nom is electricity-input capacity.
+        # Useful heat output is p0 * COP.
         electric_input_capacity = heat_capacity / cop
 
-        remove_components(network, "Link", [name])
+        # Do not fall back to the shared generic central_heat_pump carrier.
+        # A unique carrier prevents aggregation with other heat pumps.
+        unit_carrier = str(
+            unit.get("carrier")
+            or f"{name}_heat_pump"
+        )
+
+        ensure_carrier(
+            network,
+            unit_carrier,
+        )
+
+        remove_components(
+            network,
+            "Link",
+            [name],
+        )
+
         network.add(
             "Link",
             name,
-            bus0=str(unit.get("ac_bus", ac_bus)),
-            bus1=str(unit.get("heat_bus", heat_bus)),
-            carrier=str(unit.get("carrier", cfg.get("carrier", "central_heat_pump"))),
+            bus0=str(
+                unit.get(
+                    "ac_bus",
+                    ac_bus,
+                )
+            ),
+            bus1=str(
+                unit.get(
+                    "heat_bus",
+                    heat_bus,
+                )
+            ),
+            carrier=unit_carrier,
             p_nom=electric_input_capacity,
-            p_nom_extendable=_as_bool(unit.get("extendable", cfg.get("extendable", False)), False),
-            p_min_pu=float(unit.get("p_min_pu", cfg.get("p_min_pu", 0.0))),
-            p_max_pu=float(unit.get("p_max_pu", cfg.get("p_max_pu", 1.0))),
+            p_nom_extendable=_as_bool(
+                unit.get(
+                    "extendable",
+                    cfg.get("extendable", False),
+                ),
+                False,
+            ),
+            p_min_pu=float(
+                unit.get(
+                    "p_min_pu",
+                    cfg.get("p_min_pu", 0.0),
+                )
+            ),
+            p_max_pu=float(
+                unit.get(
+                    "p_max_pu",
+                    cfg.get("p_max_pu", 1.0),
+                )
+            ),
             efficiency=cop,
-            marginal_cost=float(unit.get("marginal_cost", cfg.get("marginal_cost", 0.0))),
-            capital_cost=float(unit.get("capital_cost", cfg.get("capital_cost", 0.0))),
+            marginal_cost=float(
+                unit.get(
+                    "marginal_cost",
+                    cfg.get("marginal_cost", 0.0),
+                )
+            ),
+            capital_cost=float(
+                unit.get(
+                    "capital_cost",
+                    cfg.get("capital_cost", 0.0),
+                )
+            ),
         )
 
         # Optional metadata for reporting.
-        for col, val in {
+        metadata = {
             "heat_capacity_mw": heat_capacity,
             "cop": cop,
             "planned_year": unit.get("planned_year", np.nan),
-        }.items():
+            "swfl_heat_pump_unit": name,
+        }
+
+        for column, value in metadata.items():
             try:
-                network.links.loc[name, col] = val
+                network.links.loc[name, column] = value
             except Exception:
                 pass
+
+
+def validate_swfl_heat_pumps(
+    network,
+    hp_cfg: Dict[str, Any],
+    stage: str,
+) -> pd.DataFrame:
+    """
+    Validate active planned SWFL heat pumps before or after clustering.
+
+    Matching is carrier-based, so validation still works when clustering
+    replaces the original Link names with numeric IDs.
+    """
+    if not _as_bool(
+        hp_cfg.get("active", False),
+        False,
+    ):
+        print(
+            f"\nSWFL heat-pump validation [{stage}]: inactive"
+        )
+        return pd.DataFrame()
+
+    units = hp_cfg.get("units", []) or []
+    configured_active_units = hp_cfg.get(
+        "active_units",
+        None,
+    )
+
+    if configured_active_units is not None:
+        active_names = {
+            str(name)
+            for name in configured_active_units
+        }
+    else:
+        active_names = {
+            str(unit.get("name", "")).strip()
+            for unit in units
+            if _as_bool(
+                unit.get("active", True),
+                True,
+            )
+        }
+
+    active_names.discard("")
+
+    rows = []
+    links = network.links
+
+    for unit in units:
+        name = str(
+            unit.get("name", "")
+        ).strip()
+
+        if not name or name not in active_names:
+            continue
+
+        heat_capacity = float(
+            unit.get(
+                "heat_capacity_mw",
+                60.0,
+            )
+        )
+
+        cop = float(
+            unit.get(
+                "cop",
+                hp_cfg.get("default_cop", 3.0),
+            )
+        )
+
+        expected_p_nom = heat_capacity / cop
+
+        expected_carrier = str(
+            unit.get("carrier")
+            or f"{name}_heat_pump"
+        )
+
+        matches = links[
+            links["carrier"]
+            .astype(str)
+            .eq(expected_carrier)
+        ]
+
+        # Before clustering, also accept the original component name.
+        if matches.empty and name in links.index.astype(str):
+            matches = links.loc[[name]]
+
+        if matches.empty:
+            raise ValueError(
+                f"[{stage}] Missing planned SWFL heat pump "
+                f"{name!r} with carrier {expected_carrier!r}."
+            )
+
+        if len(matches) != 1:
+            available_columns = [
+                column
+                for column in [
+                    "bus0",
+                    "bus1",
+                    "carrier",
+                    "p_nom",
+                    "p_nom_opt",
+                    "efficiency",
+                ]
+                if column in matches.columns
+            ]
+
+            raise ValueError(
+                f"[{stage}] Expected exactly one Link for {name!r}, "
+                f"but found {len(matches)}:\n"
+                + matches[available_columns].to_string()
+            )
+
+        link_id = matches.index[0]
+        row = matches.iloc[0]
+
+        # Validate configured capacity before optimisation.
+        actual_p_nom = float(row["p_nom"])
+        actual_cop = float(row["efficiency"])
+
+        rows.append(
+            {
+                "unit": name,
+                "link_id": str(link_id),
+                "carrier": str(row["carrier"]),
+                "bus0": str(row["bus0"]),
+                "bus1": str(row["bus1"]),
+                "expected_p_nom_mwel": expected_p_nom,
+                "actual_p_nom_mwel": actual_p_nom,
+                "expected_cop": cop,
+                "actual_cop": actual_cop,
+            }
+        )
+
+        if abs(actual_p_nom - expected_p_nom) > 1.0e-3:
+            raise ValueError(
+                f"[{stage}] Invalid electricity-input capacity for "
+                f"{name}: expected {expected_p_nom:.6f} MW, "
+                f"found {actual_p_nom:.6f} MW."
+            )
+
+        if abs(actual_cop - cop) > 1.0e-6:
+            raise ValueError(
+                f"[{stage}] Invalid COP for {name}: "
+                f"expected {cop:.6f}, found {actual_cop:.6f}."
+            )
+
+    if len(rows) != len(active_names):
+        found_names = {
+            row["unit"]
+            for row in rows
+        }
+
+        raise ValueError(
+            f"[{stage}] Active heat-pump configuration and validated "
+            f"units differ. Active={sorted(active_names)}, "
+            f"validated={sorted(found_names)}."
+        )
+
+    result = pd.DataFrame(rows)
+
+    print(
+        f"\nSWFL heat-pump validation [{stage}]"
+    )
+    print(
+        result.to_string(index=False)
+    )
+
+    # Diagnostic only. Generic heat pumps elsewhere in the network may remain,
+    # but they must no longer be merged with the planned SWFL units.
+    generic = links[
+        links["carrier"]
+        .astype(str)
+        .eq("central_heat_pump")
+    ]
+
+    if not generic.empty:
+        available_columns = [
+            column
+            for column in [
+                "bus0",
+                "bus1",
+                "carrier",
+                "p_nom",
+                "p_nom_opt",
+                "efficiency",
+            ]
+            if column in generic.columns
+        ]
+
+        print(
+            f"\nRemaining generic central heat pumps [{stage}]"
+        )
+        print(
+            generic[available_columns].to_string()
+        )
+
+    return result
 
 
 # =============================================================================
@@ -1280,7 +3059,7 @@ SWFL_REAL_SYSTEM_EXAMPLE = {
         # "active": True,
         # "active_units": ["swfl_gwp_1", "swfl_gwp_2"]
 
-        "carrier": "central_heat_pump",
+        # No shared carrier: each planned unit has its own carrier.
         "default_cop": 3.0,
 
         "extendable": False,
@@ -1293,6 +3072,7 @@ SWFL_REAL_SYSTEM_EXAMPLE = {
         "units": [
             {
                 "name": "swfl_gwp_1",
+                "carrier": "swfl_gwp_1_heat_pump",
                 "active": True,
                 "heat_capacity_mw": 60.0,
                 "cop": 3.0,
@@ -1302,6 +3082,7 @@ SWFL_REAL_SYSTEM_EXAMPLE = {
             },
             {
                 "name": "swfl_gwp_2",
+                "carrier": "swfl_gwp_2_heat_pump",
                 "active": True,
                 "heat_capacity_mw": 60.0,
                 "cop": 3.0,
@@ -1312,3 +3093,273 @@ SWFL_REAL_SYSTEM_EXAMPLE = {
         ],
     },
 }
+
+
+def remove_known_legacy_swfl_heat_pump_before_clustering(
+    network,
+) -> None:
+    """
+    Remove the known small legacy eGon heat pump before spatial
+    clustering.
+
+    Similar-capacity central heat pumps elsewhere in the network
+    are preserved.
+    """
+    import numpy as np
+
+    target_p_nom = 0.283661
+    links = network.links
+
+    candidates = links.loc[
+        links["carrier"].astype(str).eq(
+            "central_heat_pump"
+        )
+    ].copy()
+
+    candidates["_p_nom_numeric"] = pd.to_numeric(
+        candidates["p_nom"],
+        errors="coerce",
+    )
+
+    candidates["_capacity_difference"] = (
+        candidates["_p_nom_numeric"]
+        - target_p_nom
+    ).abs()
+
+    # Find plausible components near the expected capacity.
+    candidates = candidates.loc[
+        candidates["_capacity_difference"]
+        <= 1.0e-4
+    ].copy()
+
+    print(
+        "\nLegacy SWFL heat-pump search "
+        "[before spatial clustering]"
+    )
+
+    display_columns = [
+        column
+        for column in [
+            "bus0",
+            "bus1",
+            "carrier",
+            "p_nom",
+            "p_nom_opt",
+            "efficiency",
+            "_capacity_difference",
+        ]
+        if column in candidates.columns
+    ]
+
+    if candidates.empty:
+        raise RuntimeError(
+            "No central heat pump close to "
+            f"{target_p_nom:.6f} MW was found before "
+            "spatial clustering."
+        )
+
+    candidates = candidates.sort_values(
+        "_capacity_difference"
+    )
+
+    print("\nSimilar-capacity candidates:")
+    print(
+        candidates[display_columns].to_string()
+    )
+
+    minimum_difference = candidates[
+        "_capacity_difference"
+    ].min()
+
+    legacy = candidates.loc[
+        np.isclose(
+            candidates["_capacity_difference"],
+            minimum_difference,
+            atol=1.0e-12,
+            rtol=0.0,
+        )
+    ]
+
+    if len(legacy) != 1:
+        raise RuntimeError(
+            "Could not identify one unique closest legacy "
+            "SWFL heat pump:\n"
+            + legacy[display_columns].to_string()
+        )
+
+    legacy_id = legacy.index[0]
+
+    print("\nSelected legacy SWFL heat pump:")
+    print(
+        legacy[display_columns].to_string()
+    )
+
+    # Preserve the actual PyPSA index type.
+    network.remove(
+        "Link",
+        legacy_id,
+    )
+
+    # Verify only the selected Link itself was removed.
+    if legacy_id in network.links.index:
+        raise RuntimeError(
+            f"Legacy heat-pump Link {legacy_id!r} "
+            "still exists after removal."
+        )
+
+    print(
+        f"Removed legacy heat-pump Link {legacy_id!r} "
+        "before spatial clustering: PASS"
+    )
+
+def purge_legacy_swfl_heat_pumps(
+    network,
+    stage: str,
+) -> None:
+    """
+    Remove generic eGon heat pumps that share the clustered connection
+    of the planned SWFL GWP Links.
+
+    Uses actual index values and verifies removal immediately.
+    """
+    links = network.links
+
+    planned_carriers = {
+        "swfl_gwp_1_heat_pump",
+        "swfl_gwp_2_heat_pump",
+    }
+
+    carrier = links["carrier"].astype(str)
+
+    planned = links[
+        carrier.isin(planned_carriers)
+    ]
+
+    if planned.empty:
+        raise RuntimeError(
+            f"[{stage}] No planned SWFL heat pumps found."
+        )
+
+    planned_connections = {
+        (
+            str(row["bus0"]),
+            str(row["bus1"]),
+        )
+        for _, row in planned.iterrows()
+    }
+
+    generic_mask = carrier.isin(
+        {
+            "central_heat_pump",
+            "rural_heat_pump",
+        }
+    )
+
+    same_connection_mask = pd.Series(
+        [
+            (
+                str(row["bus0"]),
+                str(row["bus1"]),
+            )
+            in planned_connections
+            for _, row in links.iterrows()
+        ],
+        index=links.index,
+    )
+
+    legacy_ids = links.index[
+        generic_mask & same_connection_mask
+    ].tolist()
+
+    print(
+        f"\nLegacy SWFL heat-pump cleanup [{stage}]"
+    )
+
+    print(
+        "  planned connections:",
+        sorted(planned_connections),
+    )
+
+    if legacy_ids:
+        columns = [
+            column
+            for column in [
+                "bus0",
+                "bus1",
+                "carrier",
+                "p_nom",
+                "p_nom_opt",
+                "efficiency",
+            ]
+            if column in links.columns
+        ]
+
+        print(
+            "\n  Removing these legacy Links:"
+        )
+        print(
+            links.loc[
+                legacy_ids,
+                columns,
+            ].to_string()
+        )
+
+        # Pass actual index values directly to PyPSA.
+        for link_id in legacy_ids:
+            network.remove(
+                "Link",
+                link_id,
+            )
+    else:
+        print(
+            "  No legacy Link found."
+        )
+
+    # Hard verification after removal.
+    links_after = network.links
+    carrier_after = (
+        links_after["carrier"].astype(str)
+    )
+
+    generic_after = carrier_after.isin(
+        {
+            "central_heat_pump",
+            "rural_heat_pump",
+        }
+    )
+
+    same_connection_after = pd.Series(
+        [
+            (
+                str(row["bus0"]),
+                str(row["bus1"]),
+            )
+            in planned_connections
+            for _, row in links_after.iterrows()
+        ],
+        index=links_after.index,
+    )
+
+    remaining = links_after[
+        generic_after
+        & same_connection_after
+    ]
+
+    if not remaining.empty:
+        raise RuntimeError(
+            f"[{stage}] Legacy SWFL heat pump remains "
+            "after direct removal:\n"
+            + remaining[
+                [
+                    "bus0",
+                    "bus1",
+                    "carrier",
+                    "p_nom",
+                    "efficiency",
+                ]
+            ].to_string()
+        )
+
+    print(
+        f"  PASS: no legacy heat pump remains [{stage}]"
+    )
