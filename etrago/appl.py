@@ -1482,15 +1482,28 @@ def run_etrago(args, json_path):
     # calculate central etrago results
     etrago.calc_results()
 
-    result_directory = args.get(
-    "csv_export"
-    )
+    result_directory = args.get("csv_export")
 
     if result_directory:
+        result_directory = Path(result_directory)
+        result_directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
         write_resolved_config(
             resolved_scenario,
-            Path(result_directory)
-            / "resolved_config.yaml",
+            result_directory / "resolved_config.yaml",
+        )
+
+        network_path = result_directory / "network.nc"
+    
+        etrago.network.export_to_netcdf(
+            str(network_path)
+        )
+
+        print(
+            f"Saved PyPSA network: {network_path}"
         )
 
     return etrago
