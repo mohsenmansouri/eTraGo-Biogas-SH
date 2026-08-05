@@ -1,13 +1,13 @@
 # =============================================================================
 # Biogas.SH / SWFL scenario configuration
 # =============================================================================
-# Version 2 matches the current storage-aware Biogas.SH model and the detailed
+# Version 3 matches the current storage-aware Biogas.SH model and the detailed
 # SWFL unit representation.
 #
 # In normal use, edit only the "selection" section and, when needed, "run".
 # =============================================================================
 
-version: 2
+version: 3
 
 project:
   name: "Biogas.SH–SWFL"
@@ -17,7 +17,7 @@ project:
 # USER CONTROLS
 # -----------------------------------------------------------------------------
 selection:
-  natural_gas_price_case: "upstream_only"
+  fossil_gas_price_case: "legacy_egon"
   biomethane_price_case: "low_25"
   heat_pump_case: "two"
   swfl_unit_case: "all_operational"
@@ -26,34 +26,70 @@ selection:
 
 # Null means: preserve the corresponding value already defined in appl.py.
 run:
-  start_snapshot: null
-  end_snapshot: null
-  ac_clusters: null
+  start_snapshot: 1
+  end_snapshot: 24
+  ac_clusters: 50
   result_name_template: "{scenario}_{hours}h_{ac_clusters}ac"
 
 # -----------------------------------------------------------------------------
 # PRICE CASES
 # -----------------------------------------------------------------------------
-# The natural-gas value is an ADDER on the public-grid -> SWFL supply Link.
-# Keep "upstream_only" when the public CH4 grid already carries the commodity
-# cost, otherwise the gas price may be counted twice.
+# Fossil-gas commodity and CO2 costs are applied upstream to CH4_NG generators.
+# Keep the SWFL import adder at 0.0 unless an additional transport charge is
+# intentionally being modelled.
+
 price_cases:
-  natural_gas:
-    upstream_only:
-      description: "Use upstream public-grid gas cost; no additional SWFL adder."
-      swfl_import_adder_eur_per_mwh_hs: 0.0
+  fossil_gas:
+    low_2035:
+      description: >
+        Low-price sensitivity using an IEA-derived linear
+        extrapolation to 2035 and the EU Commission CO2 price.
+      gas_commodity_price_eur_per_mwh_fuel: 13.0
+      gas_source: >
+        IEA (2025), researcher-derived linear extrapolation
+        from the 2025–2030 pathway
+      gas_value_status: "derived sensitivity, not an official IEA 2035 forecast"
+      co2_price_eur_per_tco2: 50.0
+      co2_source: "European Commission (2021), EU Reference Scenario 2020"
+      emission_factor_tco2_per_mwh_fuel: 0.201
+      swfl_import_adder_eur_per_mwh_fuel: 0.0
 
-    adder_25:
-      description: "Add 25 EUR/MWh_Hs to public-grid gas entering SWFL."
-      swfl_import_adder_eur_per_mwh_hs: 25.0
+    legacy_egon:
+      description: >
+        Original eGon/eTraGo assumptions based on the
+        NEP 2021 forecast for 2035.
+      gas_commodity_price_eur_per_mwh_fuel: 25.6
+      gas_source: "NEP 2021 / eGon2035"
+      gas_value_status: "original model assumption"
+      co2_price_eur_per_tco2: 76.5
+      co2_source: "NEP 2021 / eGon2035"
+      emission_factor_tco2_per_mwh_fuel: 0.201
+      swfl_import_adder_eur_per_mwh_fuel: 0.0
 
-    adder_50:
-      description: "Add 50 EUR/MWh_Hs to public-grid gas entering SWFL."
-      swfl_import_adder_eur_per_mwh_hs: 50.0
+    high_2035:
+      description: >
+        Higher gas-price and updated high EU ETS 1 scenario.
+      gas_commodity_price_eur_per_mwh_fuel: 34.125
+      gas_source: "EWI (2022), extrapolated/model-derived 2035 value"
+      gas_value_status: "high-price sensitivity"
+      co2_price_eur_per_tco2: 144.0
+      co2_source: "UBA (2025), EU ETS 1 assumption for 2035"
+      emission_factor_tco2_per_mwh_fuel: 0.201
+      swfl_import_adder_eur_per_mwh_fuel: 0.0
 
-    adder_75:
-      description: "Add 75 EUR/MWh_Hs to public-grid gas entering SWFL."
-      swfl_import_adder_eur_per_mwh_hs: 75.0
+    crisis_2035:
+      description: >
+        Persistent-crisis sensitivity using the IRU crisis
+        gas-price level and the UBA EU ETS 1 price.
+      gas_commodity_price_eur_per_mwh_fuel: 60.0
+      gas_source: >
+        IRU (2026), short-term crisis price assumed to persist
+        as a stress scenario through 2035
+      gas_value_status: "stress assumption, not a long-term forecast"
+      co2_price_eur_per_tco2: 144.0
+      co2_source: "UBA (2025), EU ETS 1 assumption for 2035"
+      emission_factor_tco2_per_mwh_fuel: 0.201
+      swfl_import_adder_eur_per_mwh_fuel: 0.0
 
   biomethane:
     low_25:
@@ -67,13 +103,15 @@ price_cases:
     cost_based_75:
       description: "Cost-based biomethane assumption."
       marginal_cost_eur_per_mwh_hs: 75.0
-
+  
   onsite:
+    selected_electricity_case: "full_eeg"
+
     electricity_marginal_cost_eur_per_mwh:
       full_eeg: 102.4
       half_eeg: 146.0
       no_eeg: 189.5
-    selected_electricity_case: "full_eeg"
+
     heat_marginal_cost_eur_per_mwh: 0.0
 
 # -----------------------------------------------------------------------------
@@ -317,21 +355,27 @@ technical:
 scenario_matrix:
   enabled: true
   dimensions:
-    natural_gas_price_case:
-      - "upstream_only"
-      - "adder_25"
-      - "adder_50"
+    fossil_gas_price_case:
+      - "low_2035"
+      - "legacy_egon"
+      - "high_2035"
+      - "crisis_2035"
+
     biomethane_price_case:
       - "low_25"
       - "medium_50"
       - "cost_based_75"
+
     heat_pump_case:
       - "one_gwp1"
       - "two"
+
     swfl_unit_case:
       - "all_operational"
       - "k12_k13_plus_gas_to_power"
+
     biomethane_use_case:
       - "k12_k13_only"
+
     biogas_route_case:
       - "hybrid"

@@ -32,10 +32,13 @@ import os.path
 from pathlib import Path
 
 from scenario_config import (
+    apply_network_price_scenario,
     load_and_apply_config,
     scenario_summary,
     write_resolved_config,
 )
+
+CONFIG_PATH = Path(__file__).resolve().with_name("config.yaml")
 
 __copyright__ = (
     "Flensburg University of Applied Sciences, "
@@ -810,7 +813,7 @@ args = {
             "grid_supply_extendable": False,
             "grid_supply_p_nom_factor": 1.0,
             "grid_supply_efficiency": 1.0,
-            "grid_supply_marginal_cost": 0.0, #TODO: should be checked
+            "grid_supply_marginal_cost": 0.0, # Fossil-gas commodity and CO2 costs are applied upstream to CH4_NG generators.
             "grid_supply_capital_cost": 0.0,
             "grid_supply_p_nom": 1500.0,
 
@@ -934,7 +937,7 @@ args = {
         #   Full EEG:    102.4 €/MWh_el
 
         "electricity_marginal_cost": 102.4,  # Full EEG case; No EEG: 189.5, 50% EEG: 146.0
-        "heat_marginal_cost": 0.0, #TODO: should be checked
+        "heat_marginal_cost": 0.0, # Overwritten by price_cases.onsite in config.yaml.
         "biomethane_price_override_eur_per_mwh": 25.0,
         "default_biomethane_cost": 75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
         },
@@ -1419,6 +1422,12 @@ def run_etrago(args, json_path):
         etrago.network,
         scn_name=args.get("scn_name", "eGon2035"),
     )
+    
+    apply_network_price_scenario(
+        network=etrago.network,
+        resolved=resolved_scenario,
+    )
+
 
     # Validate the Biogas.SH storage topology before clustering.
     validate_biogas_sh_storage_topology(

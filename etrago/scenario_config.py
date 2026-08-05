@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple
 import yaml
 
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 
 class ScenarioConfigError(ValueError):
@@ -69,11 +69,17 @@ def _selection_with_environment_overrides(
     }
 
     environment_variables = {
-        "natural_gas_price_case": "ETRAGO_NATURAL_GAS_PRICE_CASE",
-        "biomethane_price_case": "ETRAGO_BIOMETHANE_PRICE_CASE",
+        "fossil_gas_price_case": (
+            "ETRAGO_FOSSIL_GAS_PRICE_CASE"
+        ),
+        "biomethane_price_case": (
+            "ETRAGO_BIOMETHANE_PRICE_CASE"
+        ),
         "heat_pump_case": "ETRAGO_HEAT_PUMP_CASE",
         "swfl_unit_case": "ETRAGO_SWFL_UNIT_CASE",
-        "biomethane_use_case": "ETRAGO_BIOMETHANE_USE_CASE",
+        "biomethane_use_case": (
+            "ETRAGO_BIOMETHANE_USE_CASE"
+        ),
         "biogas_route_case": "ETRAGO_BIOGAS_ROUTE_CASE",
     }
 
@@ -90,7 +96,7 @@ def _validate_selection(
     selection: Mapping[str, str],
 ) -> None:
     required_dimensions = (
-        "natural_gas_price_case",
+        "fossil_gas_price_case",
         "biomethane_price_case",
         "heat_pump_case",
         "swfl_unit_case",
@@ -106,8 +112,8 @@ def _validate_selection(
     price_cases = _require_mapping(config, "price_cases", "configuration")
     _named_case(
         price_cases,
-        "natural_gas",
-        selection["natural_gas_price_case"],
+        "fossil_gas",
+        selection["fossil_gas_price_case"],
     )
     _named_case(
         price_cases,
@@ -226,7 +232,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
 
 
 def load_config(path: str | Path) -> Dict[str, Any]:
-    """Load and validate a version-2 YAML scenario configuration."""
+    """Load and validate a version-3 YAML scenario configuration."""
     config_path = Path(path)
     if not config_path.exists():
         raise ScenarioConfigError(f"Configuration file not found: {config_path}")
@@ -247,62 +253,186 @@ def load_config(path: str | Path) -> Dict[str, Any]:
     return config
 
 
-def resolve_config(config: Mapping[str, Any]) -> Dict[str, Any]:
-    """Resolve one selected scenario into a compact reproducibility record."""
-    selection = _selection_with_environment_overrides(config)
-    _validate_selection(config, selection)
+def resolve_config(
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Resolve one selected scenario into a reproducibility record."""
 
-    price_cases = _require_mapping(config, "price_cases", "configuration")
-    natural_gas = _named_case(
-        price_cases,
-        "natural_gas",
-        selection["natural_gas_price_case"],
+    selection = _selection_with_environment_overrides(
+        config
     )
+    _validate_selection(
+        config,
+        selection,
+    )
+
+    price_cases = _require_mapping(
+        config,
+        "price_cases",
+        "configuration",
+    )
+
+    fossil_gas = _named_case(
+        price_cases,
+        "fossil_gas",
+        selection["fossil_gas_price_case"],
+    )
+
     biomethane = _named_case(
         price_cases,
         "biomethane",
         selection["biomethane_price_case"],
     )
-    onsite = _require_mapping(price_cases, "onsite", "price_cases")
+
+    onsite = _require_mapping(
+        price_cases,
+        "onsite",
+        "price_cases",
+    )
+
     onsite_electricity_cases = _require_mapping(
         onsite,
         "electricity_marginal_cost_eur_per_mwh",
         "price_cases.onsite",
     )
+
     onsite_case = str(
-        _require(onsite, "selected_electricity_case", "price_cases.onsite")
+        _require(
+            onsite,
+            "selected_electricity_case",
+            "price_cases.onsite",
+        )
     )
+
     if onsite_case not in onsite_electricity_cases:
         raise ScenarioConfigError(
-            f"Unknown onsite electricity-price case: {onsite_case}"
+            "Unknown onsite electricity-price case: "
+            f"{onsite_case}"
         )
 
+    try:
+        for case_name, value in onsite_electricity_cases.items():
+            float(value)
+
+        float(
+            _require(
+                onsite,
+                "heat_marginal_cost_eur_per_mwh",
+                "price_cases.onsite",
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScenarioConfigError(
+            "All onsite marginal costs must be numeric."
+        ) from exc
+
+    # --------------------------------------------------------
+    # Carbon-inclusive fossil natural-gas cost
+    # --------------------------------------------------------
+    gas_commodity_price = float(
+        fossil_gas[
+            "gas_commodity_price_eur_per_mwh_fuel"
+        ]
+    )
+
+    co2_price = float(
+        fossil_gas[
+            "co2_price_eur_per_tco2"
+        ]
+    )
+
+    emission_factor = float(
+        fossil_gas[
+            "emission_factor_tco2_per_mwh_fuel"
+        ]
+    )
+
+    co2_cost_on_gas = (
+        co2_price
+        * emission_factor
+    )
+
+    final_ch4_ng_cost = (
+        gas_commodity_price
+        + co2_cost_on_gas
+    )
+
+    swfl_import_adder = float(
+        fossil_gas.get(
+            "swfl_import_adder_eur_per_mwh_fuel",
+            0.0,
+        )
+    )
+
     ordered_dimensions = (
-        "natural_gas_price_case",
+        "fossil_gas_price_case",
         "biomethane_price_case",
         "heat_pump_case",
         "swfl_unit_case",
         "biomethane_use_case",
         "biogas_route_case",
     )
-    scenario_name = "__".join(selection[key] for key in ordered_dimensions)
+
+    scenario_name = "__".join(
+        selection[key]
+        for key in ordered_dimensions
+    )
 
     return {
         "config_version": CONFIG_VERSION,
         "scenario_name": scenario_name,
         "selection": selection,
         "prices": {
-            "natural_gas_swfl_import_adder_eur_per_mwh_hs": float(
-                natural_gas["swfl_import_adder_eur_per_mwh_hs"]
+            "gas_commodity_price_eur_per_mwh_fuel": (
+                gas_commodity_price
+            ),
+            "co2_price_eur_per_tco2": (
+                co2_price
+            ),
+            "emission_factor_tco2_per_mwh_fuel": (
+                emission_factor
+            ),
+            "co2_cost_on_gas_eur_per_mwh_fuel": (
+                co2_cost_on_gas
+            ),
+            "final_ch4_ng_marginal_cost_eur_per_mwh_fuel": (
+                final_ch4_ng_cost
+            ),
+            "swfl_import_adder_eur_per_mwh_fuel": (
+                swfl_import_adder
+            ),
+            "gas_source": str(
+                fossil_gas.get(
+                    "gas_source",
+                    "",
+                )
+            ),
+            "co2_source": str(
+                fossil_gas.get(
+                    "co2_source",
+                    "",
+                )
+            ),
+            "gas_value_status": str(
+                fossil_gas.get(
+                    "gas_value_status",
+                    "",
+                )
             ),
             "biomethane_marginal_cost_eur_per_mwh_hs": float(
-                biomethane["marginal_cost_eur_per_mwh_hs"]
+                biomethane[
+                    "marginal_cost_eur_per_mwh_hs"
+                ]
             ),
             "onsite_electricity_marginal_cost_eur_per_mwh": float(
-                onsite_electricity_cases[onsite_case]
+                onsite_electricity_cases[
+                    onsite_case
+                ]
             ),
             "onsite_heat_marginal_cost_eur_per_mwh": float(
-                onsite["heat_marginal_cost_eur_per_mwh"]
+                onsite[
+                    "heat_marginal_cost_eur_per_mwh"
+                ]
             ),
         },
         "heat_pumps": copy.deepcopy(
@@ -334,9 +464,18 @@ def resolve_config(config: Mapping[str, Any]) -> Dict[str, Any]:
             )
         ),
         "technical": copy.deepcopy(
-            _require_mapping(config, "technical", "configuration")
+            _require_mapping(
+                config,
+                "technical",
+                "configuration",
+            )
         ),
-        "run": copy.deepcopy(config.get("run", {})),
+        "run": copy.deepcopy(
+            config.get(
+                "run",
+                {},
+            )
+        ),
     }
 
 
@@ -517,6 +656,143 @@ def _apply_run_settings(
     }
 
 
+def apply_network_price_scenario(
+    network,
+    resolved: Mapping[str, Any],
+) -> None:
+    """
+    Apply the selected fossil-gas price to CH4_NG generators and
+    the selected biomethane price to the 21 custom Biogas.SH
+    generators.
+
+    Run after adjust_CH4_gen_carriers() and after custom
+    Biogas.SH assets are added, but before clustering.
+    """
+    prices = resolved["prices"]
+
+    fossil_gas_cost = float(
+        prices[
+            "final_ch4_ng_marginal_cost_eur_per_mwh_fuel"
+        ]
+    )
+
+    biomethane_cost = float(
+        prices[
+            "biomethane_marginal_cost_eur_per_mwh_hs"
+        ]
+    )
+
+    # Original fossil natural-gas generators.
+    ch4_ng_ids = network.generators.index[
+        network.generators["carrier"]
+        .astype(str)
+        .eq("CH4_NG")
+    ]
+
+    if len(ch4_ng_ids) == 0:
+        raise ScenarioConfigError(
+            "No CH4_NG generators found. "
+            "adjust_CH4_gen_carriers() must run first."
+        )
+
+    network.generators.loc[
+        ch4_ng_ids,
+        "marginal_cost",
+    ] = fossil_gas_cost
+
+    # Only the custom Biogas.SH biomethane generators.
+    generator_names = (
+        network.generators.index
+        .to_series()
+        .astype(str)
+    )
+
+    generator_buses = (
+        network.generators["bus"]
+        .astype(str)
+    )
+
+    custom_biomethane_mask = (
+        network.generators["carrier"]
+        .astype(str)
+        .eq("CH4_biogas")
+    )
+
+    custom_biomethane_mask &= (
+        generator_names.str.startswith(
+            "biogas_sh_ch4_bus_"
+        )
+        | generator_buses.str.startswith(
+            "biogas_sh_ch4_bus_"
+        )
+    )
+
+    custom_biomethane_ids = (
+        network.generators.index[
+            custom_biomethane_mask
+        ]
+    )
+
+    routes = resolved["biogas_routes"]
+
+    biomethane_route_active = bool(
+        routes.get("add_gas_grid_generation", False)
+        or routes.get("add_swfl_direct_supply", False)
+    )
+
+    expected_biomethane_generators = (
+        21 if biomethane_route_active else 0
+    )
+
+    if len(custom_biomethane_ids) != expected_biomethane_generators:
+        raise ScenarioConfigError(
+            "Expected "
+            f"{expected_biomethane_generators} custom Biogas.SH "
+            "biomethane generators for the selected route, "
+            f"but found {len(custom_biomethane_ids)}."
+        )
+
+    network.generators.loc[
+        custom_biomethane_ids,
+        "marginal_cost",
+    ] = biomethane_cost
+
+    print("\n=== APPLIED FUEL PRICES ===")
+    print(
+        "Fossil-gas case:",
+        resolved["selection"]["fossil_gas_price_case"],
+    )
+    print(
+        "Gas commodity:",
+        f"{prices['gas_commodity_price_eur_per_mwh_fuel']:.4f}",
+        "EUR/MWh_fuel",
+    )
+    print(
+        "CO2 price:",
+        f"{prices['co2_price_eur_per_tco2']:.4f}",
+        "EUR/tCO2",
+    )
+    print(
+        "CO2 cost on gas:",
+        f"{prices['co2_cost_on_gas_eur_per_mwh_fuel']:.4f}",
+        "EUR/MWh_fuel",
+    )
+    print(
+        "Final CH4_NG cost:",
+        f"{fossil_gas_cost:.4f}",
+        "EUR/MWh_fuel",
+    )
+    print(
+        "CH4_NG generators updated:",
+        len(ch4_ng_ids),
+    )
+    print(
+        "Custom biomethane generators updated:",
+        len(custom_biomethane_ids),
+    )
+    print("===========================")
+
+
 def apply_config_to_args(
     args: MutableMapping[str, Any],
     resolved: MutableMapping[str, Any],
@@ -548,7 +824,9 @@ def apply_config_to_args(
     # Prices.
     swfl_direct = _mutable_mapping(biogas, "swfl_direct", "args.biogas_sh")
     swfl_direct["grid_supply_marginal_cost"] = float(
-        prices["natural_gas_swfl_import_adder_eur_per_mwh_hs"]
+        prices[
+            "swfl_import_adder_eur_per_mwh_fuel"
+        ]
     )
     biogas["biomethane_price_override_eur_per_mwh"] = float(
         prices["biomethane_marginal_cost_eur_per_mwh_hs"]
@@ -804,71 +1082,266 @@ def load_and_apply_config(
     return args, resolved
 
 
-def scenario_summary(resolved: Mapping[str, Any]) -> str:
-    """Return a concise scenario and run summary."""
+def scenario_summary(
+    resolved: Mapping[str, Any],
+) -> str:
+    """Return a readable summary of the resolved scenario and run settings."""
+
     selection = resolved["selection"]
     prices = resolved["prices"]
-    heat_pumps = resolved["heat_pumps"].get("active_units", [])
+    heat_pumps = resolved["heat_pumps"]
     units = resolved["swfl_units"]
+    biomethane_use = resolved["biomethane_use"]
+    biogas_routes = resolved["biogas_routes"]
     technical_biogas = resolved["technical"]["biogas_sh"]
     effective_run = resolved.get("effective_run", {})
 
+    active_heat_pumps = list(
+        map(
+            str,
+            heat_pumps.get("active_units", []),
+        )
+    )
+
+    active_boilers = list(
+        map(
+            str,
+            units.get("boilers", []),
+        )
+    )
+
+    active_resistive_heaters = list(
+        map(
+            str,
+            units.get("resistive_heaters", []),
+        )
+    )
+
+    biomethane_eligible_units = list(
+        map(
+            str,
+            biomethane_use.get("eligible_units", []),
+        )
+    )
+
+    gas_source = (
+        str(prices.get("gas_source", "")).strip()
+        or "not specified"
+    )
+
+    co2_source = (
+        str(prices.get("co2_source", "")).strip()
+        or "not specified"
+    )
+
+    gas_value_status = (
+        str(prices.get("gas_value_status", "")).strip()
+        or "not specified"
+    )
+
+    def value_or_none(values: list[str]) -> str:
+        return ", ".join(values) if values else "none"
+
+    def yes_no(value: Any) -> str:
+        return "yes" if bool(value) else "no"
+
     lines = [
         "",
-        "=== BIOGAS.SH / SWFL SCENARIO ===",
-        f"name:                       {resolved['scenario_name']}",
-        f"natural-gas price case:     {selection['natural_gas_price_case']}",
+        "============================================================",
+        "BIOGAS.SH / SWFL SCENARIO",
+        "============================================================",
+        "",
+        "SCENARIO IDENTIFICATION",
+        "------------------------------------------------------------",
+        f"Scenario name:                  {resolved['scenario_name']}",
+        f"Configuration version:          {resolved['config_version']}",
+        "",
+        "FOSSIL NATURAL-GAS PRICE",
+        "------------------------------------------------------------",
         (
-            "SWFL gas import adder:     "
-            f"{prices['natural_gas_swfl_import_adder_eur_per_mwh_hs']:.2f} "
+            "Price scenario:                 "
+            f"{selection['fossil_gas_price_case']}"
+        ),
+        (
+            "Gas commodity price:            "
+            f"{prices['gas_commodity_price_eur_per_mwh_fuel']:.4f} "
+            "EUR/MWh_fuel"
+        ),
+        (
+            "CO2 certificate price:          "
+            f"{prices['co2_price_eur_per_tco2']:.4f} "
+            "EUR/tCO2"
+        ),
+        (
+            "Natural-gas emission factor:    "
+            f"{prices['emission_factor_tco2_per_mwh_fuel']:.4f} "
+            "tCO2/MWh_fuel"
+        ),
+        (
+            "CO2 cost on natural gas:        "
+            f"{prices['co2_cost_on_gas_eur_per_mwh_fuel']:.4f} "
+            "EUR/MWh_fuel"
+        ),
+        (
+            "Final CH4_NG marginal cost:     "
+            f"{prices['final_ch4_ng_marginal_cost_eur_per_mwh_fuel']:.4f} "
+            "EUR/MWh_fuel"
+        ),
+        (
+            "SWFL gas-import adder:          "
+            f"{prices['swfl_import_adder_eur_per_mwh_fuel']:.4f} "
+            "EUR/MWh_fuel"
+        ),
+        f"Gas-price source:              {gas_source}",
+        f"CO2-price source:              {co2_source}",
+        f"Gas-value status:              {gas_value_status}",
+        "",
+        "BIOGAS.SH COST ASSUMPTIONS",
+        "------------------------------------------------------------",
+        (
+            "Biomethane price case:          "
+            f"{selection['biomethane_price_case']}"
+        ),
+        (
+            "Biomethane marginal cost:       "
+            f"{prices['biomethane_marginal_cost_eur_per_mwh_hs']:.4f} "
             "EUR/MWh_Hs"
         ),
-        f"biomethane price case:      {selection['biomethane_price_case']}",
         (
-            "biomethane cost:           "
-            f"{prices['biomethane_marginal_cost_eur_per_mwh_hs']:.2f} "
-            "EUR/MWh_Hs"
-        ),
-        f"heat-pump case:             {selection['heat_pump_case']}",
-        (
-            "active heat pumps:          "
-            f"{', '.join(heat_pumps) if heat_pumps else 'none'}"
-        ),
-        f"SWFL unit case:             {selection['swfl_unit_case']}",
-        (
-            "active boilers:             "
-            f"{', '.join(units.get('boilers', [])) or 'none'}"
+            "Onsite electricity cost:        "
+            f"{prices['onsite_electricity_marginal_cost_eur_per_mwh']:.4f} "
+            "EUR/MWh_el"
         ),
         (
-            "active resistive heaters:   "
-            f"{', '.join(units.get('resistive_heaters', [])) or 'none'}"
+            "Onsite heat cost:               "
+            f"{prices['onsite_heat_marginal_cost_eur_per_mwh']:.4f} "
+            "EUR/MWh_th"
+        ),
+        "",
+        "SWFL TECHNOLOGY CONFIGURATION",
+        "------------------------------------------------------------",
+        (
+            "Heat-pump case:                 "
+            f"{selection['heat_pump_case']}"
         ),
         (
-            "gas-to-power active:        "
-            f"{bool(units.get('central_gas_to_power', False))}"
-        ),
-        f"biomethane use case:        {selection['biomethane_use_case']}",
-        f"Biogas.SH route case:       {selection['biogas_route_case']}",
-        (
-            "resource constraint active: "
-            f"{bool(technical_biogas['resource_constraint']['active'])}"
+            "Active heat pumps:              "
+            f"{value_or_none(active_heat_pumps)}"
         ),
         (
-            "central storage active:     "
-            f"{bool(technical_biogas['storage']['active'])}"
+            "SWFL unit case:                 "
+            f"{selection['swfl_unit_case']}"
+        ),
+        (
+            "Gas-to-power active:            "
+            f"{yes_no(units.get('central_gas_to_power', False))}"
+        ),
+        (
+            "Active gas boilers:             "
+            f"{value_or_none(active_boilers)}"
+        ),
+        (
+            "Active resistive heaters:       "
+            f"{value_or_none(active_resistive_heaters)}"
+        ),
+        (
+            "Reserve gas boiler active:      "
+            f"{yes_no(units.get('reserve_gas_boiler', False))}"
+        ),
+        "",
+        "BIOMETHANE USE AT SWFL",
+        "------------------------------------------------------------",
+        (
+            "Biomethane-use case:            "
+            f"{selection['biomethane_use_case']}"
+        ),
+        (
+            "Biomethane-use mode:            "
+            f"{biomethane_use.get('mode', 'not specified')}"
+        ),
+        (
+            "Biomethane-eligible units:      "
+            f"{value_or_none(biomethane_eligible_units)}"
+        ),
+        "",
+        "BIOGAS.SH ROUTES",
+        "------------------------------------------------------------",
+        (
+            "Route case:                     "
+            f"{selection['biogas_route_case']}"
+        ),
+        (
+            "Onsite electricity/heat:        "
+            f"{yes_no(biogas_routes.get('add_local_generation', False))}"
+        ),
+        (
+            "Storage to public gas grid:     "
+            f"{yes_no(biogas_routes.get('add_gas_grid_generation', False))}"
+        ),
+        (
+            "Storage to SWFL:                "
+            f"{yes_no(biogas_routes.get('add_swfl_direct_supply', False))}"
+        ),
+        (
+            "Regional resource constraint:   "
+            f"{yes_no(technical_biogas['resource_constraint']['active'])}"
+        ),
+        (
+            "Central biomethane storage:     "
+            f"{yes_no(technical_biogas['storage']['active'])}"
         ),
     ]
 
     if effective_run:
         lines.extend(
             [
-                f"represented hours:          {effective_run.get('represented_hours')}",
-                f"AC clusters:                {effective_run.get('ac_clusters')}",
-                f"result directory:           {effective_run.get('csv_export')}",
+                "",
+                "RUN SETTINGS",
+                "------------------------------------------------------------",
+                (
+                    "Start snapshot:                 "
+                    f"{effective_run.get('start_snapshot')}"
+                ),
+                (
+                    "End snapshot:                   "
+                    f"{effective_run.get('end_snapshot')}"
+                ),
+                (
+                    "Represented hours:              "
+                    f"{effective_run.get('represented_hours')}"
+                ),
+                (
+                    "AC clusters:                    "
+                    f"{effective_run.get('ac_clusters')}"
+                ),
+                (
+                    "Result directory:               "
+                    f"{effective_run.get('csv_export')}"
+                ),
             ]
         )
 
-    lines.append("=====================================")
+    lines.extend(
+        [
+            "",
+            "PRICE ACCOUNTING",
+            "------------------------------------------------------------",
+            (
+                "CH4_NG cost = gas commodity price "
+                "+ CO2 price × emission factor"
+            ),
+            (
+                "Fuel and CO2 costs are assigned upstream to "
+                "CH4_NG generators."
+            ),
+            (
+                "The SWFL boiler and gas-to-power Links therefore "
+                "do not repeat these costs."
+            ),
+            "============================================================",
+        ]
+    )
+
     return "\n".join(lines)
 
 
@@ -915,12 +1388,12 @@ def expand_scenario_matrix(
         record["scenario_name"] = "__".join(
             selection[key]
             for key in (
-                "natural_gas_price_case",
-                "biomethane_price_case",
-                "heat_pump_case",
-                "swfl_unit_case",
-                "biomethane_use_case",
-                "biogas_route_case",
+                    "fossil_gas_price_case",
+                    "biomethane_price_case",
+                    "heat_pump_case",
+                    "swfl_unit_case",
+                    "biomethane_use_case",
+                    "biogas_route_case",
             )
         )
         records.append(record)

@@ -21,6 +21,7 @@ etrago/results*/
 etrago/results-test/
 etrago/results_focus_sh/
 etrago/results_focus_sh_300/
+etrago/*__*h_*ac/
 
 # eTraGo generated busmap/result files
 etrago/*_result.csv
@@ -37,3 +38,10 @@ etrago/notebooks/
 etrago/*.log
 etrago/*.bak*
 etrago/*.bak_*
+
+# All CSV files
+*.csv
+
+# All Jupyter notebooks and checkpoints
+*.ipynb
+.ipynb_checkpoints/
