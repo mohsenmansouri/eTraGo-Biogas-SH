@@ -34,6 +34,8 @@ from six import iteritems
 import numpy as np
 import pandas as pd
 import pypsa.io as io
+import networkx as nx
+
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,7 @@ if "READTHEDOCS" not in os.environ:
         busmap_ehv_clustering,
         drop_nan_values,
         focus_weighting,
+        get_focus_protected_buses,
         group_links,
         kmean_clustering,
         kmedoids_dijkstra_clustering,
@@ -960,19 +963,135 @@ def postprocessing(
     drop_nan_values(clustering.network)
 
     if method == "kmedoids-dijkstra":
-        for i in clustering.network.buses[
-            clustering.network.buses.carrier == "AC"
-        ].index:
-            cluster = int(i)
-            if cluster in medoid_idx.index:
-                medoid = str(medoid_idx.loc[cluster])
 
-                clustering.network.buses.at[i, "x"] = etrago.network.buses[
-                    "x"
-                ].loc[medoid]
-                clustering.network.buses.at[i, "y"] = etrago.network.buses[
-                    "y"
-                ].loc[medoid]
+        # ------------------------------------------------------------------
+        # Restore geographical coordinates of ordinary k-medoids clusters.
+        #
+        # Standard k-medoids cluster IDs are numeric (e.g. "0", "1", ...).
+        #
+        # With explicit focus-region protection, additional cluster IDs such
+        # as:
+        #
+        #     focus_12345
+        #     boundary_10868
+        #
+        # are deliberately created. These are singleton clusters containing
+        # original AC buses and therefore already have the correct original
+        # coordinates after aggregation.
+        #
+        # They must NOT be interpreted as integer k-medoids cluster IDs.
+        # ------------------------------------------------------------------
+
+        if medoid_idx is None:
+            medoid_idx = pd.Series(dtype=str)
+
+        # Make lookup independent of whether medoid_idx currently uses
+        # integer or string cluster labels.
+        medoid_lookup = medoid_idx.copy()
+        medoid_lookup.index = medoid_lookup.index.astype(str)
+
+        ac_buses = clustering.network.buses[
+            clustering.network.buses.carrier == "AC"
+        ].index
+
+        n_medoid_coordinates_restored = 0
+        n_protected_focus_buses = 0
+        n_protected_boundary_buses = 0
+        n_other_non_medoid_buses = 0
+
+        for i in ac_buses:
+
+            cluster_label = str(i)
+
+            # --------------------------------------------------------------
+            # Explicitly protected study-region bus
+            # --------------------------------------------------------------
+            if cluster_label.startswith("focus_"):
+
+                n_protected_focus_buses += 1
+
+                # Singleton cluster:
+                    # its x/y coordinates already correspond to the original bus.
+                continue
+
+            # --------------------------------------------------------------
+            # Explicitly protected first-ring boundary bus
+            # --------------------------------------------------------------
+            if cluster_label.startswith("boundary_"):
+
+                n_protected_boundary_buses += 1
+
+                # Singleton cluster:
+                    # its x/y coordinates already correspond to the original bus.
+                continue
+
+            # --------------------------------------------------------------
+            # Ordinary k-medoids cluster
+            # --------------------------------------------------------------
+            if cluster_label in medoid_lookup.index:
+
+                medoid = str(
+                    medoid_lookup.loc[cluster_label]
+                )
+
+                if medoid not in etrago.network.buses.index.astype(str):
+
+                    logger.warning(
+                        "Medoid bus '%s' for cluster '%s' could not be found "
+                        "in the original network. Cluster coordinates are "
+                        "left unchanged.",
+                        medoid,
+                        cluster_label,
+                    )
+
+                    continue
+
+                # Because the original network index may not itself be stored
+                # as str, resolve the actual index value safely.
+                original_bus_index = (
+                    etrago.network.buses.index[
+                        etrago.network.buses.index.astype(str) == medoid
+                    ][0]
+                )
+
+                clustering.network.buses.at[
+                    i,
+                    "x",
+                ] = etrago.network.buses.at[
+                    original_bus_index,
+                    "x",
+                ]
+
+                clustering.network.buses.at[
+                    i,
+                    "y",
+                ] = etrago.network.buses.at[
+                    original_bus_index,
+                    "y",
+                ]
+
+                n_medoid_coordinates_restored += 1
+
+            else:
+
+                # This may occur for buses retained outside the normal
+                # German k-medoids mapping, e.g. some foreign/special buses.
+                # Their current clustered coordinates are retained.
+                n_other_non_medoid_buses += 1
+
+        logger.info(
+            "\n"
+            "K-MEDOIDS COORDINATE POSTPROCESSING\n"
+            "---------------------------------------------\n"
+            f"medoid cluster coordinates restored: "
+            f"{n_medoid_coordinates_restored}\n"
+            f"protected focus buses retained:       "
+            f"{n_protected_focus_buses}\n"
+            f"protected boundary buses retained:    "
+            f"{n_protected_boundary_buses}\n"
+            f"other AC buses left unchanged:        "
+            f"{n_other_non_medoid_buses}\n"
+        )
 
     if aggregate_links:
         clustering.network.links, clustering.network.links_t = group_links(
@@ -1125,103 +1244,1410 @@ def weighting_for_scenario(network, save=None):
 
 def run_spatial_clustering(self):
     """
-    Main method for running spatial clustering on the electrical network.
-    Allows for clustering based on k-means and k-medoids dijkstra.
+    Run spatial clustering of the electrical network.
 
-    Parameters
-    -----------
-    self
-        The object pointer for an Etrago object containing all relevant
-        parameters and data
+    This implementation extends the standard eTraGo clustering workflow
+    with explicit high-resolution protection of a configured focus region.
+
+    Detailed-focus mode
+    -------------------
+    If a focus region is configured and
+    ``cluster_within_focus == False``:
+
+    * every AC bus inside the focus region is retained as a singleton;
+    * the first AC boundary ring outside the focus region is also retained;
+    * focus buses receive labels ``focus_<original_bus>``;
+    * boundary buses receive labels ``boundary_<original_bus>``;
+    * all remaining AC buses are clustered normally;
+    * the original eTraGo hard focus weight of 100000 is deliberately
+      avoided;
+    * after PyPSA clustering, protected-to-protected lines are checked for
+      zero/non-finite reactance;
+    * damaged protected lines are restored from their actual pre-clustering
+      physical branch(es), identified through mapped endpoints rather than
+      line IDs.
+
+    No artificial impedance values are introduced. If a valid source branch
+    cannot be identified, clustering stops with an explicit error.
 
     Returns
     -------
     None
     """
-    if self.args["network_clustering"]["electricity_grid"]["active"]:
-        if self.args["spatial_disaggregation"] is not None:
-            self.disaggregated_network = self.network.copy()
-        else:
-            self.disaggregated_network = self.network.copy(with_time=False)
 
-        elec_network, weight, n_clusters, busmap_foreign = preprocessing(self)
+    # ==================================================================
+    # 0. Read clustering configuration
+    # ==================================================================
 
-        focus_region = self.args["network_clustering"]["method"][
-            "focus_region"
-        ]
-        if focus_region:
+    clustering_args = self.args[
+        "network_clustering"
+    ]
+
+    electricity_args = clustering_args[
+        "electricity_grid"
+    ]
+
+    method_args = clustering_args[
+        "method"
+    ]
+
+    if not electricity_args.get(
+        "active",
+        False,
+    ):
+        logger.info(
+            "Electrical spatial clustering is disabled."
+        )
+        return
+
+    focus_region = method_args.get(
+        "focus_region"
+    )
+
+    cluster_within_focus = (
+        electricity_args.get(
+            "cluster_within_focus"
+        )
+    )
+
+    algorithm = method_args.get(
+        "algorithm"
+    )
+
+    k_elec_busmap = electricity_args.get(
+        "k_elec_busmap"
+    )
+
+    per_country = method_args.get(
+        "per_country",
+        True,
+    )
+
+    cpu_cores = method_args.get(
+        "cpu_cores",
+        1,
+    )
+
+    zero_x_tolerance = 1e-12
+
+    explicit_focus_protection = bool(
+        focus_region
+        and cluster_within_focus is False
+    )
+
+    # ==================================================================
+    # 1. Preserve original network for spatial disaggregation
+    # ==================================================================
+
+    if self.args.get(
+        "spatial_disaggregation"
+    ) is not None:
+
+        self.disaggregated_network = (
+            self.network.copy()
+        )
+
+    else:
+
+        self.disaggregated_network = (
+            self.network.copy(
+                with_time=False
+            )
+        )
+
+    # ==================================================================
+    # 2. Standard eTraGo preprocessing
+    # ==================================================================
+
+    (
+        elec_network,
+        weight,
+        n_clusters,
+        busmap_foreign,
+    ) = preprocessing(
+        self
+    )
+
+    # IMPORTANT:
+    #
+    # These are the actual electrical branches entering spatial
+    # clustering. They are therefore the correct source for later
+    # protected-line restoration.
+    #
+    # Do not use line IDs from self.network after clustering to identify
+    # physical branches because PyPSA may rebuild/re-index lines.
+    source_lines = (
+        elec_network.lines.copy(
+            deep=True
+        )
+    )
+
+    source_lines["_source_id"] = (
+        source_lines.index.astype(str)
+    )
+
+    source_lines["bus0"] = (
+        source_lines["bus0"]
+        .astype(str)
+    )
+
+    source_lines["bus1"] = (
+        source_lines["bus1"]
+        .astype(str)
+    )
+
+    # ==================================================================
+    # 3. Initialize focus-region containers
+    # ==================================================================
+
+    focus_buses = pd.Index(
+        [],
+        dtype=str,
+    )
+
+    boundary_buses = pd.Index(
+        [],
+        dtype=str,
+    )
+
+    protected_buses = pd.Index(
+        [],
+        dtype=str,
+    )
+
+    # ==================================================================
+    # 4. Focus-region treatment
+    # ==================================================================
+
+    if focus_region:
+
+        # --------------------------------------------------------------
+        # 4A. Detailed focus: explicit singleton protection
+        # --------------------------------------------------------------
+
+        if explicit_focus_protection:
+
+            logger.info(
+                "Focus region enabled with explicit nodal protection. "
+                "AC buses inside the focus region and the first boundary "
+                "ring will remain individually represented."
+            )
+
+            if k_elec_busmap:
+
+                raise ValueError(
+                    "Explicit focus-region protection cannot be combined "
+                    "with a precomputed k_elec_busmap. "
+                    "Set k_elec_busmap to False."
+                )
+
+            # ----------------------------------------------------------
+            # Apply the usual distance-dependent focus weighting, but
+            # deliberately suppress the upstream 100000 hard focus
+            # weight.
+            #
+            # Actual preservation is performed explicitly through the
+            # busmap below.
+            # ----------------------------------------------------------
+
             weight = focus_weighting(
                 self,
                 elec_network,
                 weight,
                 focus_region=focus_region,
-                cluster_within=self.args["network_clustering"][
-                    "electricity_grid"
-                ]["cluster_within_focus"],
-                per_country=self.args["network_clustering"]["method"][
-                    "per_country"
-                ],
-                cpu_cores=self.args["network_clustering"]["method"][
-                    "cpu_cores"
-                ],
+                cluster_within=True,
+                per_country=per_country,
+                cpu_cores=cpu_cores,
             )
 
-        if self.args["network_clustering"]["method"]["algorithm"] == "kmeans":
-            if not self.args["network_clustering"]["electricity_grid"][
-                "k_elec_busmap"
-            ]:
-                logger.info("Start k-means Clustering AC")
+            (
+                _protected,
+                focus_buses,
+                boundary_buses,
+            ) = get_focus_protected_buses(
+                self,
+                elec_network,
+                focus_region=focus_region,
+                per_country=per_country,
+                include_border=True,
+            )
 
-                busmap = kmean_clustering(
-                    self, elec_network, weight, n_clusters
+            focus_buses = pd.Index(
+                focus_buses.astype(str)
+            )
+
+            boundary_buses = pd.Index(
+                boundary_buses.astype(str)
+            )
+
+            protected_buses = (
+                focus_buses.union(
+                    boundary_buses
                 )
-                medoid_idx = pd.Series(dtype=str)
-            else:
-                busmap = pd.Series(dtype=str)
-                medoid_idx = pd.Series(dtype=str)
+            )
 
-        elif (
-            self.args["network_clustering"]["method"]["algorithm"]
-            == "kmedoids-dijkstra"
-        ):
-            if not self.args["network_clustering"]["electricity_grid"][
-                "k_elec_busmap"
-            ]:
-                logger.info("Start k-medoids Dijkstra Clustering AC")
+            logger.info(
+                "\n"
+                "DETAILED FOCUS-REGION CLUSTERING\n"
+                "--------------------------------------------------\n"
+                f"focus regions:          {focus_region}\n"
+                f"focus AC buses:         {len(focus_buses)}\n"
+                f"boundary AC buses:      {len(boundary_buses)}\n"
+                f"protected AC buses:     {len(protected_buses)}\n"
+                f"base external clusters: {n_clusters}\n"
+            )
 
-                busmap, medoid_idx = kmedoids_dijkstra_clustering(
-                    self,
-                    elec_network.buses,
-                    elec_network.lines,
-                    weight,
-                    n_clusters,
-                )
+        # --------------------------------------------------------------
+        # 4B. Standard eTraGo focus clustering
+        # --------------------------------------------------------------
 
-            else:
-                busmap = pd.Series(dtype=str)
-                medoid_idx = pd.Series(dtype=str)
+        else:
 
-        clustering, busmap = postprocessing(
-            self, busmap, busmap_foreign, medoid_idx
+            weight = focus_weighting(
+                self,
+                elec_network,
+                weight,
+                focus_region=focus_region,
+                cluster_within=cluster_within_focus,
+                per_country=per_country,
+                cpu_cores=cpu_cores,
+            )
+
+    # ==================================================================
+    # 5. Run configured AC clustering algorithm
+    # ==================================================================
+
+    busmap = pd.Series(
+        dtype=str
+    )
+
+    medoid_idx = pd.Series(
+        dtype=str
+    )
+
+    if algorithm == "kmeans":
+
+        if not k_elec_busmap:
+
+            logger.info(
+                "Start k-means Clustering AC"
+            )
+
+            busmap = kmean_clustering(
+                self,
+                elec_network,
+                weight,
+                n_clusters,
+            )
+
+    elif algorithm == "kmedoids-dijkstra":
+
+        if not k_elec_busmap:
+
+            logger.info(
+                "Start k-medoids Dijkstra Clustering AC"
+            )
+
+            (
+                busmap,
+                medoid_idx,
+            ) = kmedoids_dijkstra_clustering(
+                self,
+                elec_network.buses,
+                elec_network.lines,
+                weight,
+                n_clusters,
+            )
+
+    else:
+
+        raise ValueError(
+            "Unknown electrical clustering algorithm "
+            f"{algorithm!r}. Expected 'kmeans' or "
+            "'kmedoids-dijkstra'."
         )
-        self.update_busmap(busmap)
 
-        self.network = clustering.network
+    # ==================================================================
+    # 6. Explicit singleton protection of focus/boundary buses
+    # ==================================================================
 
-        self.buses_by_country()
+    if explicit_focus_protection:
 
-        self.geolocation_buses()
+        if not isinstance(
+            busmap,
+            pd.Series,
+        ):
 
-        # The control parameter is overwritten in pypsa's clustering.
-        # The function network.determine_network_topology is called,
-        # which sets slack bus(es).
-        set_control_strategies(self.network)
+            busmap = pd.Series(
+                busmap
+            )
 
-        logger.info(
-            "Network clustered to {} buses with ".format(
-                self.args["network_clustering"]["electricity_grid"][
-                    "n_clusters"
+        busmap = (
+            busmap.copy()
+        )
+
+        busmap.index = (
+            busmap.index.astype(str)
+        )
+
+        busmap = (
+            busmap.astype(str)
+        )
+
+        # --------------------------------------------------------------
+        # Verify all protected buses exist in the clustering busmap.
+        # --------------------------------------------------------------
+
+        missing_focus = (
+            focus_buses.difference(
+                busmap.index
+            )
+        )
+
+        missing_boundary = (
+            boundary_buses.difference(
+                busmap.index
+            )
+        )
+
+        if len(missing_focus):
+
+            raise RuntimeError(
+                "The following focus buses are missing from "
+                "the clustering busmap:\n"
+                f"{missing_focus.tolist()}"
+            )
+
+        if len(missing_boundary):
+
+            raise RuntimeError(
+                "The following boundary buses are missing from "
+                "the clustering busmap:\n"
+                f"{missing_boundary.tolist()}"
+            )
+
+        # --------------------------------------------------------------
+        # Protect each focus bus as one singleton.
+        # --------------------------------------------------------------
+
+        for bus in focus_buses:
+
+            busmap.loc[
+                str(bus)
+            ] = (
+                f"focus_{bus}"
+            )
+
+        # --------------------------------------------------------------
+        # Protect each boundary bus as one singleton.
+        # --------------------------------------------------------------
+
+        for bus in boundary_buses:
+
+            busmap.loc[
+                str(bus)
+            ] = (
+                f"boundary_{bus}"
+            )
+
+        # --------------------------------------------------------------
+        # Validate singleton behaviour.
+        # --------------------------------------------------------------
+
+        protected_labels = (
+            busmap.reindex(
+                protected_buses
+            )
+        )
+
+        if protected_labels.isna().any():
+
+            missing = (
+                protected_labels[
+                    protected_labels.isna()
+                ].index.tolist()
+            )
+
+            raise RuntimeError(
+                "Protected buses lost their cluster mapping: "
+                f"{missing}"
+            )
+
+        if (
+            protected_labels.nunique()
+            != len(protected_buses)
+        ):
+
+            duplicated = (
+                protected_labels[
+                    protected_labels.duplicated(
+                        keep=False
+                    )
                 ]
             )
-            + self.args["network_clustering"]["method"]["algorithm"]
+
+            raise RuntimeError(
+                "Focus/boundary buses are not unique singleton "
+                "clusters:\n"
+                f"{duplicated}"
+            )
+
+        logger.info(
+            "\n"
+            "FOCUS BUSMAP PROTECTION APPLIED\n"
+            "--------------------------------------------------\n"
+            f"focus buses protected:       "
+            f"{len(focus_buses)}\n"
+            f"boundary buses protected:    "
+            f"{len(boundary_buses)}\n"
+            f"base requested clusters:     "
+            f"{n_clusters}\n"
+            f"final unique busmap groups:  "
+            f"{busmap.nunique()}\n"
         )
+
+    # ==================================================================
+    # 7. Standard eTraGo / PyPSA postprocessing
+    # ==================================================================
+
+    (
+        clustering,
+        busmap,
+    ) = postprocessing(
+        self,
+        busmap,
+        busmap_foreign,
+        medoid_idx,
+    )
+
+    clustered_network = (
+        clustering.network
+    )
+
+    # ==================================================================
+    # 8. Repair protected AC lines damaged during clustering
+    #
+    # The critical point:
+    #
+    # DO NOT match:
+    #
+    #     clustered line ID -> original line ID
+    #
+    # PyPSA can rebuild/re-index the line table.
+    #
+    # Instead identify the original physical branch through:
+    #
+    #     original endpoints
+    #          ↓ busmap
+    #     clustered endpoints
+    #
+    # ==================================================================
+
+    restored_lines = []
+
+    if explicit_focus_protection:
+
+        # --------------------------------------------------------------
+        # Normalize final busmap without modifying network indices.
+        # --------------------------------------------------------------
+
+        if isinstance(
+            busmap,
+            pd.Series,
+        ):
+
+            final_busmap = (
+                busmap.copy()
+            )
+
+        else:
+
+            final_busmap = pd.Series(
+                busmap
+            )
+
+        final_busmap.index = (
+            final_busmap.index.astype(str)
+        )
+
+        final_busmap = (
+            final_busmap.astype(str)
+        )
+
+        # --------------------------------------------------------------
+        # Determine where every source line endpoint ended up.
+        # --------------------------------------------------------------
+
+        mapped_source_lines = (
+            source_lines.copy()
+        )
+
+        mapped_source_lines[
+            "_mapped_bus0"
+        ] = (
+            mapped_source_lines[
+                "bus0"
+            ].map(
+                final_busmap
+            )
+        )
+
+        mapped_source_lines[
+            "_mapped_bus1"
+        ] = (
+            mapped_source_lines[
+                "bus1"
+            ].map(
+                final_busmap
+            )
+        )
+
+        # --------------------------------------------------------------
+        # Find invalid lines AFTER PyPSA clustering.
+        # --------------------------------------------------------------
+
+        clustered_x = pd.to_numeric(
+            clustered_network.lines[
+                "x"
+            ],
+            errors="coerce",
+        )
+
+        bad_line_mask = (
+            ~np.isfinite(
+                clustered_x
+            )
+            |
+            (
+                clustered_x.abs()
+                <= zero_x_tolerance
+            )
+        )
+
+        bad_line_indices = (
+            clustered_network.lines.index[
+                bad_line_mask
+            ]
+        )
+
+        protected_prefixes = (
+            "focus_",
+            "boundary_",
+        )
+
+        unresolved_lines = []
+
+        # --------------------------------------------------------------
+        # Helper: equivalent impedance for actual parallel source
+        # branches.
+        # --------------------------------------------------------------
+
+        def _parallel_equivalent(
+            series,
+            tolerance=1e-12,
+        ):
+            """
+            Equivalent value for parallel branch impedance.
+
+            Returns NaN if one or more source values are invalid.
+            """
+
+            values = pd.to_numeric(
+                series,
+                errors="coerce",
+            )
+
+            if (
+                values.isna().any()
+                or
+                (~np.isfinite(values)).any()
+                or
+                (values.abs() <= tolerance).any()
+            ):
+                return np.nan
+
+            return (
+                1.0
+                /
+                (
+                    1.0
+                    / values
+                ).sum()
+            )
+
+        # --------------------------------------------------------------
+        # Helper: capacity-weighted representative length
+        # --------------------------------------------------------------
+
+        def _representative_length(
+            candidates,
+        ):
+
+            if (
+                "length"
+                not in candidates.columns
+            ):
+                return np.nan
+
+            lengths = pd.to_numeric(
+                candidates["length"],
+                errors="coerce",
+            )
+
+            if lengths.notna().sum() == 0:
+                return np.nan
+
+            if (
+                "s_nom"
+                in candidates.columns
+            ):
+
+                capacities = pd.to_numeric(
+                    candidates["s_nom"],
+                    errors="coerce",
+                ).fillna(0.0)
+
+                total_capacity = (
+                    capacities.sum()
+                )
+
+                if total_capacity > 0:
+
+                    return float(
+                        (
+                            lengths.fillna(0.0)
+                            * capacities
+                        ).sum()
+                        /
+                        total_capacity
+                    )
+
+            return float(
+                lengths.mean()
+            )
+
+        # --------------------------------------------------------------
+        # Repair each invalid clustered line
+        # --------------------------------------------------------------
+
+        for clustered_index in bad_line_indices:
+
+            clustered_row = (
+                clustered_network.lines.loc[
+                    clustered_index
+                ]
+            )
+
+            clustered_bus0 = str(
+                clustered_row[
+                    "bus0"
+                ]
+            )
+
+            clustered_bus1 = str(
+                clustered_row[
+                    "bus1"
+                ]
+            )
+
+            # ----------------------------------------------------------
+            # Automatically repair ONLY branches fully contained inside
+            # our explicitly protected representation.
+            #
+            # We do not silently change standard external clustering.
+            # ----------------------------------------------------------
+
+            protected_to_protected = (
+                clustered_bus0.startswith(
+                    protected_prefixes
+                )
+                and
+                clustered_bus1.startswith(
+                    protected_prefixes
+                )
+            )
+
+            if not protected_to_protected:
+
+                logger.error(
+                    "Invalid AC line %s is outside the fully protected "
+                    "focus/boundary network: %s -> %s.",
+                    clustered_index,
+                    clustered_bus0,
+                    clustered_bus1,
+                )
+
+                unresolved_lines.append(
+                    str(
+                        clustered_index
+                    )
+                )
+
+                continue
+
+            # ----------------------------------------------------------
+            # Identify pre-clustering source branch(es) according to
+            # their mapped endpoints.
+            #
+            # Direction can be equal or reversed.
+            # ----------------------------------------------------------
+
+            same_direction = (
+                (
+                    mapped_source_lines[
+                        "_mapped_bus0"
+                    ]
+                    == clustered_bus0
+                )
+                &
+                (
+                    mapped_source_lines[
+                        "_mapped_bus1"
+                    ]
+                    == clustered_bus1
+                )
+            )
+
+            reverse_direction = (
+                (
+                    mapped_source_lines[
+                        "_mapped_bus0"
+                    ]
+                    == clustered_bus1
+                )
+                &
+                (
+                    mapped_source_lines[
+                        "_mapped_bus1"
+                    ]
+                    == clustered_bus0
+                )
+            )
+
+            candidates = (
+                mapped_source_lines[
+                    same_direction
+                    |
+                    reverse_direction
+                ].copy()
+            )
+
+            # A source branch which maps both ends to the same final bus
+            # cannot represent this surviving clustered line.
+            candidates = candidates[
+                candidates[
+                    "_mapped_bus0"
+                ]
+                !=
+                candidates[
+                    "_mapped_bus1"
+                ]
+            ]
+
+            if candidates.empty:
+
+                logger.error(
+                    "No pre-clustering source line could be found for "
+                    "protected clustered line %s: %s -> %s.",
+                    clustered_index,
+                    clustered_bus0,
+                    clustered_bus1,
+                )
+
+                unresolved_lines.append(
+                    str(
+                        clustered_index
+                    )
+                )
+
+                continue
+
+            # ----------------------------------------------------------
+            # Validate source x.
+            # ----------------------------------------------------------
+
+            source_x = pd.to_numeric(
+                candidates["x"],
+                errors="coerce",
+            )
+
+            invalid_source_x = (
+                source_x.isna()
+                |
+                (~np.isfinite(source_x))
+                |
+                (
+                    source_x.abs()
+                    <= zero_x_tolerance
+                )
+            )
+
+            if invalid_source_x.any():
+
+                logger.error(
+                    "\n"
+                    "Cannot safely restore clustered line %s "
+                    "(%s -> %s).\n"
+                    "One or more matching source branches already have "
+                    "invalid reactance:\n%s",
+                    clustered_index,
+                    clustered_bus0,
+                    clustered_bus1,
+                    candidates[
+                        [
+                            column
+                            for column in [
+                                "_source_id",
+                                "bus0",
+                                "bus1",
+                                "_mapped_bus0",
+                                "_mapped_bus1",
+                                "x",
+                                "r",
+                                "s_nom",
+                                "length",
+                            ]
+                            if column
+                            in candidates.columns
+                        ]
+                    ].to_string(
+                        index=False
+                    ),
+                )
+
+                unresolved_lines.append(
+                    str(
+                        clustered_index
+                    )
+                )
+
+                continue
+
+            # ==========================================================
+            # CASE A: exactly one original physical branch
+            # ==========================================================
+
+            if len(candidates) == 1:
+
+                source_row = (
+                    candidates.iloc[0]
+                )
+
+                restored_x = float(
+                    source_row["x"]
+                )
+
+                if (
+                    "r"
+                    in source_row.index
+                ):
+                    restored_r = (
+                        source_row["r"]
+                    )
+                else:
+                    restored_r = np.nan
+
+                if (
+                    "g"
+                    in source_row.index
+                ):
+                    restored_g = (
+                        source_row["g"]
+                    )
+                else:
+                    restored_g = np.nan
+
+                if (
+                    "b"
+                    in source_row.index
+                ):
+                    restored_b = (
+                        source_row["b"]
+                    )
+                else:
+                    restored_b = np.nan
+
+                if (
+                    "length"
+                    in source_row.index
+                ):
+                    restored_length = (
+                        source_row["length"]
+                    )
+                else:
+                    restored_length = np.nan
+
+                source_description = (
+                    str(
+                        source_row[
+                            "_source_id"
+                        ]
+                    )
+                )
+
+            # ==========================================================
+            # CASE B: several physical source branches map onto the same
+            # protected endpoints.
+            #
+            # Because protected buses are singletons, these are parallel
+            # branches, not series branches.
+            # ==========================================================
+
+            else:
+
+                restored_x = (
+                    _parallel_equivalent(
+                        candidates[
+                            "x"
+                        ]
+                    )
+                )
+
+                if (
+                    "r"
+                    in candidates.columns
+                ):
+
+                    restored_r = (
+                        _parallel_equivalent(
+                            candidates[
+                                "r"
+                            ]
+                        )
+                    )
+
+                else:
+
+                    restored_r = np.nan
+
+                # Parallel shunt admittances add.
+                if (
+                    "g"
+                    in candidates.columns
+                ):
+
+                    restored_g = (
+                        pd.to_numeric(
+                            candidates[
+                                "g"
+                            ],
+                            errors="coerce",
+                        ).sum(
+                            min_count=1
+                        )
+                    )
+
+                else:
+
+                    restored_g = np.nan
+
+                if (
+                    "b"
+                    in candidates.columns
+                ):
+
+                    restored_b = (
+                        pd.to_numeric(
+                            candidates[
+                                "b"
+                            ],
+                            errors="coerce",
+                        ).sum(
+                            min_count=1
+                        )
+                    )
+
+                else:
+
+                    restored_b = np.nan
+
+                restored_length = (
+                    _representative_length(
+                        candidates
+                    )
+                )
+
+                source_description = (
+                    ", ".join(
+                        candidates[
+                            "_source_id"
+                        ].astype(str)
+                    )
+                )
+
+                if (
+                    not np.isfinite(
+                        restored_x
+                    )
+                    or
+                    abs(
+                        restored_x
+                    )
+                    <= zero_x_tolerance
+                ):
+
+                    logger.error(
+                        "Parallel source branches for clustered line %s "
+                        "could not produce a valid equivalent reactance.",
+                        clustered_index,
+                    )
+
+                    unresolved_lines.append(
+                        str(
+                            clustered_index
+                        )
+                    )
+
+                    continue
+
+            # ----------------------------------------------------------
+            # Save clustered values for diagnostics
+            # ----------------------------------------------------------
+
+            x_before = (
+                clustered_network.lines.at[
+                    clustered_index,
+                    "x",
+                ]
+            )
+
+            r_before = (
+                clustered_network.lines.at[
+                    clustered_index,
+                    "r",
+                ]
+                if "r"
+                in clustered_network.lines.columns
+                else np.nan
+            )
+
+            length_before = (
+                clustered_network.lines.at[
+                    clustered_index,
+                    "length",
+                ]
+                if "length"
+                in clustered_network.lines.columns
+                else np.nan
+            )
+
+            # ----------------------------------------------------------
+            # Restore x.
+            # ----------------------------------------------------------
+
+            clustered_network.lines.at[
+                clustered_index,
+                "x",
+            ] = restored_x
+
+            # ----------------------------------------------------------
+            # Restore r when valid.
+            # ----------------------------------------------------------
+
+            if (
+                "r"
+                in clustered_network.lines.columns
+                and
+                pd.notna(
+                    restored_r
+                )
+                and
+                np.isfinite(
+                    restored_r
+                )
+            ):
+
+                clustered_network.lines.at[
+                    clustered_index,
+                    "r",
+                ] = restored_r
+
+            # ----------------------------------------------------------
+            # Restore g.
+            # ----------------------------------------------------------
+
+            if (
+                "g"
+                in clustered_network.lines.columns
+                and
+                pd.notna(
+                    restored_g
+                )
+                and
+                np.isfinite(
+                    restored_g
+                )
+            ):
+
+                clustered_network.lines.at[
+                    clustered_index,
+                    "g",
+                ] = restored_g
+
+            # ----------------------------------------------------------
+            # Restore b.
+            # ----------------------------------------------------------
+
+            if (
+                "b"
+                in clustered_network.lines.columns
+                and
+                pd.notna(
+                    restored_b
+                )
+                and
+                np.isfinite(
+                    restored_b
+                )
+            ):
+
+                clustered_network.lines.at[
+                    clustered_index,
+                    "b",
+                ] = restored_b
+
+            # ----------------------------------------------------------
+            # Restore representative physical length.
+            # ----------------------------------------------------------
+
+            if (
+                "length"
+                in clustered_network.lines.columns
+                and
+                pd.notna(
+                    restored_length
+                )
+                and
+                np.isfinite(
+                    restored_length
+                )
+            ):
+
+                clustered_network.lines.at[
+                    clustered_index,
+                    "length",
+                ] = restored_length
+
+            restored_lines.append(
+                str(
+                    clustered_index
+                )
+            )
+
+            logger.info(
+                "\n"
+                "RESTORED PROTECTED AC LINE\n"
+                "--------------------------------------------------\n"
+                f"clustered line:       {clustered_index}\n"
+                f"clustered endpoints:  "
+                f"{clustered_bus0} -> {clustered_bus1}\n"
+                f"source line(s):        "
+                f"{source_description}\n"
+                f"x before:              "
+                f"{x_before}\n"
+                f"x restored:            "
+                f"{restored_x}\n"
+                f"r before:              "
+                f"{r_before}\n"
+                f"r restored:            "
+                f"{restored_r}\n"
+                f"length before:         "
+                f"{length_before}\n"
+                f"length restored:       "
+                f"{restored_length}\n"
+            )
+
+        # ==============================================================
+        # 9. Validate post-repair line reactances
+        # ==============================================================
+
+        checked_x = pd.to_numeric(
+            clustered_network.lines[
+                "x"
+            ],
+            errors="coerce",
+        )
+
+        still_bad_mask = (
+            ~np.isfinite(
+                checked_x
+            )
+            |
+            (
+                checked_x.abs()
+                <= zero_x_tolerance
+            )
+        )
+
+        still_bad_lines = (
+            clustered_network.lines[
+                still_bad_mask
+            ]
+        )
+
+        if not still_bad_lines.empty:
+
+            columns = [
+                column
+                for column in [
+                    "bus0",
+                    "bus1",
+                    "carrier",
+                    "x",
+                    "r",
+                    "s_nom",
+                    "v_nom",
+                    "length",
+                ]
+                if column
+                in still_bad_lines.columns
+            ]
+
+            raise RuntimeError(
+                "\n"
+                "Zero or non-finite AC line reactance remains after "
+                "endpoint-based protected-line restoration.\n"
+                "The following branches are not safe for LOPF:\n\n"
+                + still_bad_lines[
+                    columns
+                ].to_string()
+            )
+
+        logger.info(
+            "\n"
+            "PROTECTED LINE RESTORATION COMPLETE\n"
+            "--------------------------------------------------\n"
+            f"restored clustered lines: "
+            f"{restored_lines}\n"
+            f"unresolved lines:         "
+            f"{unresolved_lines}\n"
+            "PASS: all clustered AC lines have finite "
+            "non-zero reactance.\n"
+        )
+
+    # ==================================================================
+    # 10. Store final clustering busmap
+    # ==================================================================
+
+    self.update_busmap(
+        busmap
+    )
+
+    # ==================================================================
+    # 11. Replace active network with clustered network
+    # ==================================================================
+
+    self.network = (
+        clustered_network
+    )
+
+    # ==================================================================
+    # 12. Restore country/geographical information
+    # ==================================================================
+
+    self.buses_by_country()
+
+    self.geolocation_buses()
+
+    # ==================================================================
+    # 13. Restore generator/storage control strategies
+    #
+    # PyPSA topology/clustering calls can overwrite control assignments.
+    # ==================================================================
+
+    set_control_strategies(
+        self.network
+    )
+
+    # ==================================================================
+    # 14. Final electrical integrity check
+    # ==================================================================
+
+    final_x = pd.to_numeric(
+        self.network.lines[
+            "x"
+        ],
+        errors="coerce",
+    )
+
+    final_bad_mask = (
+        ~np.isfinite(
+            final_x
+        )
+        |
+        (
+            final_x.abs()
+            <= zero_x_tolerance
+        )
+    )
+
+    final_bad_lines = (
+        self.network.lines[
+            final_bad_mask
+        ]
+    )
+
+    if not final_bad_lines.empty:
+
+        columns = [
+            column
+            for column in [
+                "bus0",
+                "bus1",
+                "carrier",
+                "x",
+                "r",
+                "s_nom",
+                "v_nom",
+                "length",
+            ]
+            if column
+            in final_bad_lines.columns
+        ]
+
+        raise RuntimeError(
+            "\n"
+            "Spatial clustering produced an electrically invalid "
+            "AC network.\n"
+            "Zero/non-finite reactance remains:\n\n"
+            + final_bad_lines[
+                columns
+            ].to_string()
+        )
+
+    # ==================================================================
+    # 15. Final clustering diagnostics
+    # ==================================================================
+
+    final_ac_buses = (
+        self.network.buses[
+            self.network.buses[
+                "carrier"
+            ].astype(str)
+            == "AC"
+        ]
+    )
+
+    logger.info(
+        "\n"
+        "SPATIAL CLUSTERING FINISHED\n"
+        "--------------------------------------------------\n"
+        f"algorithm:                    "
+        f"{algorithm}\n"
+        f"requested base clusters:      "
+        f"{n_clusters}\n"
+        f"final AC buses:               "
+        f"{len(final_ac_buses)}\n"
+        f"focus region:                 "
+        f"{focus_region}\n"
+        f"cluster within focus:         "
+        f"{cluster_within_focus}\n"
+        f"protected focus buses:        "
+        f"{len(focus_buses)}\n"
+        f"protected boundary buses:     "
+        f"{len(boundary_buses)}\n"
+        f"restored protected lines:     "
+        f"{len(restored_lines)}\n"
+        f"invalid AC reactance lines:   "
+        f"{len(final_bad_lines)}\n"
+    )

@@ -57,6 +57,10 @@ if "READTHEDOCS" not in os.environ:
     # Do not import internal packages directly.
     from etrago import Etrago
 
+    from etrago.tools.utilities import (
+        restore_load_shedding_after_clustering,
+    )
+
     from etrago.tools.swfl_real_system import (
         apply_swfl_real_system,
         purge_legacy_swfl_heat_pumps,
@@ -120,13 +124,13 @@ DEBUG_LOG_PATH = DATA_PATHS.DEBUG_LOG_PATH
 
 args = {
     # Setup and Configuration:
-    "db": "local_egon2035",  # database session: oep or local database
+    "db": "oep",  # database session: oep or local database
     "gridversion": None,  # None for model_draft or version number
 
     "method": {  # choose method and settings for optimization
         "type": "lopf",  # type of optimization, 'lopf' or 'sclopf'
         "n_iter": 4,  # abort criterion of iterative optimization, 'n_iter' or 'threshold'
-        "formulation": "pyomo",  # pyomo or linopy
+        "formulation": "linopy",  # pyomo or linopy
         "market_optimization": {
             "active": True,
             "market_zones": "status_quo",  # only used if type='market_grid'
@@ -144,24 +148,17 @@ args = {
         "add_foreign_lopf": True,  # keep results of lopf for foreign DC-links
         "q_allocation": "p_nom",  # allocate reactive power via 'p_nom' or 'p'
     },
-
     "start_snapshot": 1,
-    "end_snapshot": 24,
+    "end_snapshot": 168,
     "solver": "gurobi",  # glpk, cplex or gurobi
 
     "solver_options": {
-        # "BarConvTol": 1.0e-6,
-        "FeasibilityTol": 1.0e-6,
-        "OptimalityTol": 1.0e-6,
-        "Method": 1,  # 2,
+        "FeasibilityTol": 1e-5,
+        "Method": 2,
+        "BarConvTol": 1e-5,
+        "BarHomogeneous": 1,
         "Crossover": 0,
-        "LogFile": "solver_etrago.log",
         "Threads": 4,
-        # "BarHomogeneous": 1,
-        "ScaleFlag": 1,
-        "NumericFocus": 3,
-        "DualReductions": 0,
-        "InfUnbdInfo": 1,
     },
 
     "model_formulation": "kirchhoff",  # angles or kirchhoff
@@ -172,7 +169,7 @@ args = {
 
     # Export options:
     "lpfile": False,  # save pyomo's lp file: False or /path/to/lpfile.lp
-    "csv_export": "biogas_sh_hybrid_24h_50ac_two_hp_test_advanced_swfl_removed_unexp_v5",  # save results as csv: False or /path/tofolder
+    "csv_export": "biogas_sh_hybrid_10h_50ac_hybrid",  # save results as csv: False or /path/tofolder
 
     # Settings:
     "extendable": {
@@ -220,7 +217,24 @@ args = {
 
     "network_clustering": {
         "method": {
-            "focus_region": str(BIOGAS_SH_FOCUS_REGION),  # None, shape-file or list with string for Kreise
+            #"focus_region": str(BIOGAS_SH_FOCUS_REGION),  # None, shape-file or list with string for Kreise
+            "focus_region": [
+                "Flensburg",
+                #"Kiel",
+                #"Lübeck",
+                #"Neumünster",
+                #"Dithmarschen",
+                #"Herzogtum Lauenburg",
+                "Nordfriesland",
+                #"Ostholstein",
+                #"Pinneberg",
+                #"Plön",
+                #"Rendsburg-Eckernförde",
+                "Schleswig-Flensburg",
+                #"Segeberg",
+                #"Steinburg",
+                #"Stormarn",
+            ],
             "per_country": True,  # if True, buses are restricted to one cluster per foreign country
             "algorithm": "kmedoids-dijkstra",  # choose clustering method: kmeans or kmedoids-dijkstra
             "remove_stubs": False,  # remove stubs before kmeans clustering
@@ -768,7 +782,7 @@ args = {
         #   "swfl"     -> biomethane direct to artificial SWFL CH4 bus only
         #   "hybrid"   -> all three routes active
         #   "custom"   -> use the booleans below independently
-        "scenario_mode": "custom",
+        "scenario_mode": "hybrid",
 
         "add_local_generation": True, #use Biogas.SH → supply local heat and electricty
         "add_gas_grid_generation": True, #add Biogas.SH → public gas grid injection route.
@@ -914,6 +928,10 @@ args = {
         # Plant carriers for onsite route.
         "ac_only_carrier": "biogas_sh_onsite_el",
         "chp_el_carrier": "biogas_sh_onsite_chp_el",
+
+        "supported_ac_only_carrier": "biogas_sh_onsite_el_supported",
+        "supported_chp_el_carrier": "biogas_sh_onsite_chp_el_supported",
+
         "chp_heat_carrier": "biogas_sh_onsite_chp_heat",
 
         # Capacities.
@@ -922,24 +940,53 @@ args = {
         "hours_for_heat_capacity": 8760.0,
         "hours_for_gas_capacity": 8760.0,
 
-        # Costs.
-        # Raw biogas purchase price from real plant data:
-        #   7.2 ct/kWh_Hs = 72.0 €/MWh_Hs_raw
+        # ------------------------------------------------------------------
+        # Final Biogas.SH economic assumptions
+        # ------------------------------------------------------------------
+        # Raw biogas:
+        #   7.5 ct/kWh_Hs = 75.0 €/MWh_Hs
         #
-        # Biomethane route:
-        #   96% upgrading yield is already applied in the CSV:
-        #   72.0 / 0.96 = 75.0 €/MWh_Hs_biomethane
+        # Merchant onsite electricity:
+        #   75 / 0.38 = 197.37 €/MWh_el
         #
-        # Onsite electricity route:
-        #   based on raw biogas cost and eta_el = 0.38:
-        #   No EEG:      72.0 / 0.38 = 189.5 €/MWh_el
-        #   50% EEG:     146.0 €/MWh_el
-        #   Full EEG:    102.4 €/MWh_el
+        # Onsite heat:
+        #   75 / 0.45 = 166.67 €/MWh_th
+        #
+        # Central biomethane:
+        #   75 + 17.9 = 92.9 €/MWh_Hs
+        #
+        # The 92.9 €/MWh_Hs is an all-in fixed cost representation.
+        # PSA electricity, compression electricity, pipeline CAPEX and
+        # storage CAPEX are therefore NOT added separately.
 
-        "electricity_marginal_cost": 102.4,  # Full EEG case; No EEG: 189.5, 50% EEG: 146.0
-        "heat_marginal_cost": 0.0, # Overwritten by price_cases.onsite in config.yaml.
-        "biomethane_price_override_eur_per_mwh": 25.0,
-        "default_biomethane_cost": 75.0,     # €/MWh_Hs_biomethane after 96% upgrading yield
+        "raw_biogas_cost_eur_per_mwh_hs": 75.0,
+
+        "electricity_marginal_cost": 197.37,
+        "heat_marginal_cost": 166.67,
+
+        "biomethane_price_override_eur_per_mwh": 92.9,
+        "default_biomethane_cost": 92.9,
+        },
+
+        "support": {
+            # Safe default if config.yaml has not overridden the run.
+            "case": "post_eeg",
+
+            "eeg_active": False,
+
+            "market_electricity_marginal_cost": 197.37,
+            "supported_electricity_marginal_cost": 110.31,
+
+            "supported_hours_per_year": 0.0,
+
+            "flexibility_active": False,
+            "chp_capacity_multiplier": 1.0,
+
+            "flex_capex_eur_per_kw": 800.0,
+            "flex_lifetime_years": 15,
+            "flex_discount_rate": 0.05,
+            "flex_fixed_om_fraction": 0.02,
+            "flexibility_payment_eur_per_kw_year": 0.0,
         },
 }
 
@@ -1414,32 +1461,173 @@ def run_etrago(args, json_path):
         args.get("swfl_real_system", {}),
     )
 
+    biogas_sh_active = bool(
+        args.get("biogas_sh", {}).get("active", False)
+    )
+
+    swfl_active = bool(
+        args.get("swfl_real_system", {}).get("active", False)
+    )
+
+    if not biogas_sh_active:
+
+        extra = args.setdefault(
+            "extra_functionality",
+            {},
+        )
+
+        # --------------------------------------------------
+        # Disable EEG/flex constraints belonging exclusively
+        # to the Biogas.SH plant fleet.
+        # --------------------------------------------------
+        support = extra.get(
+            "biogas_sh_support"
+        )
+
+        if isinstance(support, dict):
+            support["active"] = False
+
+        # --------------------------------------------------
+        # Disable the regional Biogas.SH resource constraint.
+        # No Biogas.SH plants exist in this control run.
+        # --------------------------------------------------
+        resource = extra.get(
+            "biogas_sh_resource"
+        )
+
+        if isinstance(resource, dict):
+            resource["active"] = False
+            resource["ignore_missing_components"] = True
+
+        logger.info(
+            "Biogas.SH inactive: disabled "
+            "Biogas.SH support/resource constraints."
+        )
+
     # Biogas.SH connects to buses created by the SWFL setup
     apply_biogas_sh_assets(etrago)
+
+    # ------------------------------------------------------------
+    # Preserve ordinary public-grid CH4 supply to SWFL even when
+    # Biogas.SH assets are disabled.
+    # ------------------------------------------------------------
+    if (not biogas_sh_active) and swfl_active:
+
+        n = etrago.network
+
+        public_ch4_bus = "47538"
+        swfl_ch4_bus = "biogas_sh_swfl_ch4_bus"
+
+        grid_supply_link = (
+            "biogas_sh_swfl_grid_supply_47538_to_swfl"
+        )
+
+        if public_ch4_bus not in n.buses.index:
+            raise RuntimeError(
+                f"Public CH4 bus {public_ch4_bus} is missing."
+            )
+
+        if swfl_ch4_bus not in n.buses.index:
+            raise RuntimeError(
+                f"SWFL CH4 bus {swfl_ch4_bus} is missing."
+            )
+
+        if grid_supply_link not in n.links.index:
+
+            if "biogas_sh_swfl_grid_supply" not in n.carriers.index:
+                n.add(
+                    "Carrier",
+                    "biogas_sh_swfl_grid_supply",
+                )
+
+            n.add(
+                "Link",
+                grid_supply_link,
+                bus0=public_ch4_bus,
+                bus1=swfl_ch4_bus,
+                carrier="biogas_sh_swfl_grid_supply",
+                p_nom=1500.0,
+                p_nom_extendable=False,
+                efficiency=1.0,
+                marginal_cost=0.0,
+                capital_cost=0.0,
+                p_min_pu=0.0,
+                p_max_pu=1.0,
+                scn_name="eGon2035",
+            )
+
+            logger.info(
+                "Biogas.SH inactive: retained ordinary "
+                "public-grid CH4 supply %s -> %s.",
+                public_ch4_bus,
+                swfl_ch4_bus,
+            )
+
+    if (not biogas_sh_active) and swfl_active:
+
+        n = etrago.network
+
+        biomethane_bus = "swfl_real_biomethane_ch4_bus"
+
+        if biomethane_bus in n.buses.index:
+
+            # Find every Link connected to the biomethane-only bus.
+            attached_links = n.links.index[
+                n.links["bus0"].astype(str).eq(biomethane_bus)
+                | n.links["bus1"].astype(str).eq(biomethane_bus)
+            ].tolist()
+
+            logger.info(
+                "Biogas.SH inactive: removing biomethane-only "
+                "SWFL links: %s",
+                attached_links,
+            )
+
+            for link_id in attached_links:
+                n.remove("Link", link_id)
+
+            # The bus itself has no role in the no-Biogas baseline.
+            n.remove("Bus", biomethane_bus)
+
+            logger.info(
+                "Biogas.SH inactive: removed unused SWFL "
+                "biomethane bus '%s'.",
+                biomethane_bus,
+            )
+
 
     # Assign the selected scenario name to custom components
     fix_custom_component_scn_names(
         etrago.network,
         scn_name=args.get("scn_name", "eGon2035"),
     )
-    
+
     apply_network_price_scenario(
         network=etrago.network,
         resolved=resolved_scenario,
+        biogas_sh_active=biogas_sh_active,
     )
 
 
     # Validate the Biogas.SH storage topology before clustering.
-    validate_biogas_sh_storage_topology(
-        network=etrago.network,
-        args=args,
-    )
+    if biogas_sh_active:
+        validate_biogas_sh_storage_topology(
+            network=etrago.network,
+            args=args,
+        )
+    else:
+        logger.info(
+            "Biogas.SH inactive: "
+            "storage topology validation skipped."
+        )
 
     # remove the original eGon heat pump
 
-    remove_known_legacy_swfl_heat_pump_before_clustering(
-        etrago.network,
-    )
+    if swfl_active:
+
+        remove_known_legacy_swfl_heat_pump_before_clustering(
+            etrago.network,
+        )
 
     etrago.spatial_clustering()
 
@@ -1449,11 +1637,43 @@ def run_etrago(args, json_path):
         .get("future_heat_pumps", {})
     )
 
-    if future_hp_cfg.get("active", False):
+    if swfl_active and future_hp_cfg.get("active", False):
         purge_legacy_swfl_heat_pumps(
             etrago.network,
             stage="after spatial clustering",
         )
+
+
+    if (not biogas_sh_active) and swfl_active:
+
+        n = etrago.network
+        b = "biogas_sh_swfl_ch4_bus"
+
+        print("\nNO-BIOGAS SWFL CH4 CHECK")
+        print("----------------------------------")
+        print(
+            "SWFL bus carrier:",
+            n.buses.loc[b, "carrier"],
+        )
+
+        mask = (
+            n.links.bus0.astype(str).eq(b)
+            | n.links.bus1.astype(str).eq(b)
+        )
+
+        print(
+            n.links.loc[
+                mask,
+                [
+                    "bus0",
+                    "bus1",
+                    "carrier",
+                    "p_nom",
+                ],
+            ].to_string()
+        )
+
+        print("----------------------------------\n")
 
 
     etrago.spatial_clustering_gas()
@@ -1474,6 +1694,14 @@ def run_etrago(args, json_path):
     print("Stores:", n.stores.shape)
 
     # Consistency check
+    n.consistency_check()
+
+    restore_load_shedding_after_clustering(
+        etrago,
+        negative_load_shedding=("Li_ion",),
+    )
+
+    # Network was modified by the restoration, so check again.
     n.consistency_check()
 
     # start linear optimal powerflow calculations
@@ -1506,7 +1734,7 @@ def run_etrago(args, json_path):
         )
 
         network_path = result_directory / "network.nc"
-    
+
         etrago.network.export_to_netcdf(
             str(network_path)
         )

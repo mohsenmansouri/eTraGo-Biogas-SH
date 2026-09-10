@@ -737,10 +737,33 @@ def _get_ch4_p_nom(row, settings) -> float:
 # =============================================================================
 
 
-def _add_electricity_generator(network, plant_id: int, ac_bus: str, carrier: str, p_nom: float, mc: float) -> None:
+def _add_electricity_generator(
+    network,
+    plant_id,
+    ac_bus,
+    carrier,
+    p_nom,
+    mc,
+    tranche="market",
+) -> str:
     """Add plant electricity generator."""
-    name = f"biogas_sh_el_{plant_id}"
-    _remove_component_if_exists(network, "Generator", name)
+
+    if tranche == "market":
+        # Preserve old name for backwards compatibility.
+        name = f"biogas_sh_el_{plant_id}"
+    elif tranche == "supported":
+        name = f"biogas_sh_el_supported_{plant_id}"
+    else:
+        raise ValueError(
+            f"Unsupported Biogas.SH electricity tranche: {tranche}"
+        )
+
+    _remove_component_if_exists(
+        network,
+        "Generator",
+        name,
+    )
+
     network.add(
         "Generator",
         name,
@@ -758,6 +781,8 @@ def _add_electricity_generator(network, plant_id: int, ac_bus: str, carrier: str
         lifetime=np.inf,
         committable=False,
     )
+
+    return name
 
 
 
@@ -1332,10 +1357,6 @@ def _add_ch4_storage_input_link_from_plant(
             "biogas_sh_route",
         ] = "plant_to_storage"
 
-        network.links.loc[
-            link_name,
-            "biogas_sh_plant_id",
-        ] = int(plant_id)
     except Exception:
         pass
 
@@ -2113,6 +2134,20 @@ def apply_biogas_sh_assets(self) -> None:
         )
     ).strip()
 
+    supported_ac_only_carrier = str(
+        settings.get(
+            "supported_ac_only_carrier",
+            "biogas_sh_onsite_el_supported",
+        )
+    ).strip()
+
+    supported_chp_el_carrier = str(
+        settings.get(
+            "supported_chp_el_carrier",
+            "biogas_sh_onsite_chp_el_supported",
+        )
+    ).strip()
+
     chp_heat_carrier = str(
         settings.get(
             "chp_heat_carrier",
@@ -2153,6 +2188,8 @@ def apply_biogas_sh_assets(self) -> None:
     required_carriers = [
         ac_only_carrier,
         chp_el_carrier,
+        supported_ac_only_carrier,
+        supported_chp_el_carrier,
         chp_heat_carrier,
         "CH4",
         "CH4_biogas",
@@ -2180,24 +2217,71 @@ def apply_biogas_sh_assets(self) -> None:
     # =========================================================================
     # 4. Read cost and gas-topology settings
     # =========================================================================
-    el_mc = float(
-        settings.get(
-            "electricity_marginal_cost",
-            42.1,
+    support_cfg = settings.get("support", {}) or {}
+
+    support_case = str(
+        support_cfg.get(
+            "case",
+            "post_eeg",
+        )
+    ).strip()
+
+    eeg_active = _as_bool(
+        support_cfg.get(
+            "eeg_active",
+            False,
+        ),
+        False,
+    )
+
+    chp_capacity_multiplier = float(
+        support_cfg.get(
+            "chp_capacity_multiplier",
+            1.0,
+        )
+    )
+
+    if chp_capacity_multiplier <= 0:
+        raise ValueError(
+            "biogas_sh.support.chp_capacity_multiplier "
+            "must be greater than zero."
+        )
+
+    market_el_mc = float(
+        support_cfg.get(
+            "market_electricity_marginal_cost",
+            settings.get(
+                "electricity_marginal_cost",
+                197.37,
+            ),
+        )
+    )
+
+    supported_el_mc = float(
+        support_cfg.get(
+            "supported_electricity_marginal_cost",
+            110.31,
+        )
+    )
+
+    supported_hours_per_year = float(
+        support_cfg.get(
+            "supported_hours_per_year",
+            0.0,
         )
     )
 
     heat_mc = float(
         settings.get(
             "heat_marginal_cost",
-            0.0,
+            166.67,
         )
     )
 
     default_biomethane_cost = float(
         settings.get(
             "default_biomethane_cost",
-            75.0,
+            92.9,
         )
     )
 
@@ -2414,9 +2498,16 @@ def apply_biogas_sh_assets(self) -> None:
                 )
             )
 
-            p_nom_el = _get_electric_p_nom(
+            base_p_nom_el = _get_electric_p_nom(
                 row,
                 settings,
+            )
+
+            # S1 and S3: multiplier = 1
+            # S2 flexibility scenario: multiplier = 3
+            p_nom_el = (
+                base_p_nom_el
+                * chp_capacity_multiplier
             )
 
             potential_el_capacity += float(
@@ -2463,7 +2554,10 @@ def apply_biogas_sh_assets(self) -> None:
                 )
 
             else:
-                electricity_carrier = (
+                # --------------------------------------------------------------
+                # Merchant electricity tranche
+                # --------------------------------------------------------------
+                market_carrier = (
                     chp_el_carrier
                     if has_heat
                     else ac_only_carrier
@@ -2473,10 +2567,32 @@ def apply_biogas_sh_assets(self) -> None:
                     network=network,
                     plant_id=plant_id,
                     ac_bus=ac_bus,
-                    carrier=electricity_carrier,
+                    carrier=market_carrier,
                     p_nom=p_nom_el,
-                    mc=el_mc,
+                    mc=market_el_mc,
+                    tranche="market",
                 )
+
+                # --------------------------------------------------------------
+                # EEG-supported electricity tranche
+                # --------------------------------------------------------------
+                if eeg_active:
+
+                    supported_carrier = (
+                        supported_chp_el_carrier
+                        if has_heat
+                        else supported_ac_only_carrier
+                    )
+
+                    _add_electricity_generator(
+                        network=network,
+                        plant_id=plant_id,
+                        ac_bus=ac_bus,
+                        carrier=supported_carrier,
+                        p_nom=p_nom_el,
+                        mc=supported_el_mc,
+                        tranche="supported",
+                    )
 
                 added_el += 1
                 added_el_capacity += float(
@@ -2782,6 +2898,41 @@ def apply_biogas_sh_assets(self) -> None:
     print(
         f"  storage-to-SWFL carrier:          "
         f"{storage_swfl_carrier}"
+    )
+
+    print(
+        f"  support case:                     "
+        f"{support_case}"
+    )
+
+    print(
+        f"  EEG support active:               "
+        f"{eeg_active}"
+    )
+
+    print(
+        f"  market electricity MC:            "
+        f"{market_el_mc:.2f} €/MWh_el"
+    )
+
+    if eeg_active:
+        print(
+            f"  supported electricity MC:         "
+            f"{supported_el_mc:.2f} €/MWh_el"
+        )
+        print(
+            f"  supported hours/year:             "
+            f"{supported_hours_per_year:.1f}"
+        )
+
+    print(
+        f"  CHP capacity multiplier:          "
+        f"{chp_capacity_multiplier:.2f}"
+    )
+
+    print(
+        f"  heat marginal cost:               "
+        f"{heat_mc:.2f} €/MWh_th"
     )
 
     if add_swfl_direct_supply:

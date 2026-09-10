@@ -4,40 +4,317 @@
 # Version 3 matches the current storage-aware Biogas.SH model and the detailed
 # SWFL unit representation.
 #
-# In normal use, edit only the "selection" section and, when needed, "run".
+# In normal use, edit "selection", "batch", and, when needed, "run".
 # =============================================================================
 
 version: 3
 
 project:
-  name: "Biogas.SH–SWFL"
+  name: "Biogas.SH"
   description: "Storage-aware Biogas.SH and detailed Stadtwerke Flensburg scenarios"
 
-# -----------------------------------------------------------------------------
-# USER CONTROLS
-# -----------------------------------------------------------------------------
+# =============================================================================
+# SCENARIO SELECTION
+# =============================================================================
+#
+# This block selects one complete Biogas.SH model run.
+#
+# CORE SCENARIO DESIGN
+# --------------------
+# In the main analysis only TWO dimensions are varied:
+#
+#   1. fossil_gas_price_case
+#   2. support_case
+#
+# This gives:
+#
+#       4 gas-price cases × 3 support cases = 12 core scenarios
+#
+# All other assumptions are kept fixed so that differences between runs can
+# be attributed clearly to:
+#
+#   - fossil-gas market conditions, and
+#   - EEG / flexibilisation policy.
+#
+# IMPORTANT:
+# The Biogas.SH route is ALWAYS "hybrid" in the core analysis.
+# This means that all physical utilisation pathways are simultaneously
+# available and the optimiser decides how to allocate the common raw-biogas
+# resource between them.
+#
+# Available hybrid routes:
+#
+#   Raw biogas
+#      ├──> onsite CHP electricity
+#      ├──> onsite heat
+#      └──> central biomethane production
+#                └──> central storage
+#                       ├──> public CH4 grid
+#                       └──> dedicated SWFL biomethane route
+#
+# The three major pathways have been checked separately with debug runs:
+#
+#   onsite utilisation                -> functional
+#   biomethane -> public CH4 grid     -> functional
+#   biomethane -> SWFL / K12-K13      -> functional
+#
+# Therefore, zero flow on one of these routes in a normal scenario can be
+# interpreted as an optimisation result rather than automatically as a
+# missing physical connection.
+# =============================================================================
+
 selection:
-  fossil_gas_price_case: "legacy_egon"
-  biomethane_price_case: "low_25"
-  heat_pump_case: "two"
+
+  # ---------------------------------------------------------------------------
+  # 1. FOSSIL NATURAL-GAS PRICE CASE
+  # ---------------------------------------------------------------------------
+  #
+  # Main market sensitivity.
+  #
+  # Available choices:
+  #
+  #   "low_2035"
+  #       Low gas-price sensitivity.
+  #       Represents a future with relatively inexpensive fossil natural gas.
+  #
+  #   "legacy_egon"
+  #       Original eGon/eTraGo 2035 assumption.
+  #       Useful mainly as a direct comparison with the original model setup.
+  #
+  #   "high_2035"
+  #       Higher 2035 gas-price case combined with a high EU ETS CO2 price.
+  #
+  #   "crisis_2035"
+  #       Stress case with persistently high fossil-gas prices.
+  #       Intended as an upper-price sensitivity, not as a central forecast.
+  #
+  # CORE RUNS:
+  # Run all four cases for every support scenario.
+  #
+  fossil_gas_price_case: "high_2035"
+
+
+  # ---------------------------------------------------------------------------
+  # 2. BIOMETHANE COST CASE
+  # ---------------------------------------------------------------------------
+  #
+  # In the core scenarios this is FIXED.
+  #
+  # Available choices:
+  #
+  #   "project_92_9"
+  #       Main Biogas.SH project assumption:
+  #
+  #           92.9 EUR/MWh_Hs biomethane
+  #
+  #       This is the simplified project-specific all-in cost representing
+  #       raw biogas plus the central collection/upgrading pathway and the
+  #       associated infrastructure/full-cost assumptions.
+  #
+  #   "debug_10"
+  #       DEBUG ONLY.
+  #
+  #       Artificial biomethane cost:
+  #
+  #           10 EUR/MWh_Hs
+  #
+  #       Used only to force biomethane dispatch and verify that the central
+  #       upgrading, storage, public-grid and SWFL routes are technically
+  #       functional.
+  #
+  #       DO NOT use this case for economic interpretation.
+  #
+  # CORE RUNS:
+  # Always use "project_92_9".
+  #
+  biomethane_price_case: "project_92_9"
+
+  co2_sale_case: "medium_76_5"
+
+
+  # ---------------------------------------------------------------------------
+  # 3. EEG / FLEXIBILITY SUPPORT CASE
+  # ---------------------------------------------------------------------------
+  #
+  # Main policy dimension of the study.
+  #
+  # Available choices:
+  #
+  #   "post_eeg"
+  #
+  #       Scenario S1: Post-EEG / market-only operation
+  #
+  #       - no follow-on EEG support
+  #       - no supported CHP generation tranche
+  #       - no CHP flexibilisation
+  #       - CHP capacity multiplier = 1
+  #       - no flexibility payment
+  #
+  #       Route allocation is mainly driven by market conditions.
+  #
+  #
+  #   "followon_eeg_no_flex"
+  #
+  #       Scenario S3: Follow-on EEG without flexibilisation
+  #
+  #       - follow-on EEG support active
+  #       - supported CHP operating-cost assumption active
+  #       - supported operating-hours abstraction active
+  #       - existing CHP capacity retained
+  #       - CHP capacity multiplier = 1
+  #       - no flexibility payment
+  #
+  #       Comparison:
+  #
+  #           S3 - S1
+  #
+  #       isolates the effect of continued EEG support.
+  #
+  #
+  #   "followon_eeg_flex"
+  #
+  #       Scenario S2: Follow-on EEG + flexibilisation
+  #
+  #       - follow-on EEG support active
+  #       - supported CHP operating-cost assumption active
+  #       - supported operating-hours abstraction active
+  #       - electrical CHP capacity expanded exogenously
+  #       - CHP capacity multiplier = 3
+  #       - flexibility payment considered in scenario economics
+  #
+  #       Comparison:
+  #
+  #           S2 - S3
+  #
+  #       isolates the additional effect of flexibilisation.
+  #
+  # CORE RUNS:
+  # Run all three support cases for every fossil-gas price case.
+  #
+  support_case: "followon_eeg_flex"
+
+
+  # ---------------------------------------------------------------------------
+  # 4. SWFL HEAT-PUMP CONFIGURATION
+  # ---------------------------------------------------------------------------
+  #
+  # Technical assumption for the Stadtwerke Flensburg system.
+  #
+  # CORE RUNS:
+  # Keep this fixed so that heat-pump configuration does not become another
+  # scenario dimension.
+  #
+  # Current core configuration:
+  #
+  #   "two"
+  #       Use the two modelled/planned SWFL heat pumps.
+  #
+  # Other values should only be used if a corresponding case is explicitly
+  # defined in the heat-pump case configuration.
+  #
+  heat_pump_case: "one_gwp1"
+
+
+  # ---------------------------------------------------------------------------
+  # 5. SWFL UNIT AVAILABILITY
+  # ---------------------------------------------------------------------------
+  #
+  # Controls which modelled Stadtwerke Flensburg generation / heat-production
+  # units are available.
+  #
+  # CORE RUNS:
+  #
+  #   "all_operational"
+  #       All units represented as operational in the selected model setup
+  #       remain available.
+  #
+  # Keep fixed across the 12 core scenarios so that changing unit availability
+  # does not obscure the gas-price and support effects.
+  #
   swfl_unit_case: "all_operational"
+
+
+  # ---------------------------------------------------------------------------
+  # 6. BIOMETHANE USE AT SWFL
+  # ---------------------------------------------------------------------------
+  #
+  # Defines which SWFL units are allowed to receive biomethane from the
+  # dedicated Biogas.SH -> SWFL biomethane bus.
+  #
+  # CORE RUNS:
+  #
+  #   "k12_k13_only"
+  #       Dedicated project biomethane may be supplied to K12 and K13.
+  #
+  # The public natural-gas supply remains a separate pathway.
+  #
+  # Thus the model can distinguish between:
+  #
+  #       public CH4 grid -> SWFL natural-gas system
+  #
+  # and
+  #
+  #       Biogas.SH storage -> SWFL biomethane bus -> K12/K13
+  #
   biomethane_use_case: "k12_k13_only"
+
+
+  # ---------------------------------------------------------------------------
+  # 7. BIOGAS.SH ROUTE CONFIGURATION
+  # ---------------------------------------------------------------------------
+  #
+  # ALWAYS use "hybrid" for the main analysis.
+  #
+  #   "hybrid"
+  #
+  # means that the optimiser simultaneously has access to:
+  #
+  #       1. onsite CHP electricity
+  #       2. onsite heat
+  #       3. central biomethane -> public CH4 grid
+  #       4. central biomethane -> direct SWFL route
+  #
+  # These are NOT separate scenario assumptions.
+  #
+  # The purpose of the optimisation is precisely to determine which route,
+  # or combination of routes, is economically preferred under each gas-price
+  # and policy scenario.
+  #
+  # Consequently, do NOT switch between individual routes for the core
+  # scenario comparison.
+  #
+  # Route-exclusive configurations should only be used as explicit debugging
+  # or validation tests.
+  #
   biogas_route_case: "hybrid"
+
+# ---------------------------------------------------------------------------
+
+# Each batch entry overrides only the values shown in that entry. All other
+# dimensions are inherited from "selection" above. The four entries below
+# therefore run the same technical scenario with four fossil-gas price cases.
+batch:
+  enabled: false
+  stop_on_error: true
+  scenarios:
+    - fossil_gas_price_case: "low_2035"
+    - fossil_gas_price_case: "legacy_egon"
+    - fossil_gas_price_case: "high_2035"
+    - fossil_gas_price_case: "crisis_2035"
 
 # Null means: preserve the corresponding value already defined in appl.py.
 run:
   start_snapshot: 1
-  end_snapshot: 24
+  end_snapshot: 72
   ac_clusters: 50
   result_name_template: "{scenario}_{hours}h_{ac_clusters}ac"
 
 # -----------------------------------------------------------------------------
 # PRICE CASES
 # -----------------------------------------------------------------------------
-# Fossil-gas commodity and CO2 costs are applied upstream to CH4_NG generators.
-# Keep the SWFL import adder at 0.0 unless an additional transport charge is
-# intentionally being modelled.
-
+# The natural-gas value is an ADDER on the public-grid -> SWFL supply Link.
+# Keep "upstream_only" when the public CH4 grid already carries the commodity
+# cost, otherwise the gas price may be counted twice.
 price_cases:
   fossil_gas:
     low_2035:
@@ -92,27 +369,132 @@ price_cases:
       swfl_import_adder_eur_per_mwh_fuel: 0.0
 
   biomethane:
-    low_25:
-      description: "Low-cost/support-style biomethane assumption."
-      marginal_cost_eur_per_mwh_hs: 25.0
+      project_92_9:
+          description: >
+            Biogas.SH project-specific fixed all-in biomethane cost.
+            Includes raw biogas, collection pipeline, upgrading,
+            central storage/infrastructure and associated full costs.
+          marginal_cost_eur_per_mwh_hs: 92.9
+      debug_10:
+          description: >
+            for debugging.
+          marginal_cost_eur_per_mwh_hs: 10.0
 
-    medium_50:
-      description: "Intermediate biomethane cost."
-      marginal_cost_eur_per_mwh_hs: 50.0
 
-    cost_based_75:
-      description: "Cost-based biomethane assumption."
-      marginal_cost_eur_per_mwh_hs: 75.0
-  
   onsite:
-    selected_electricity_case: "full_eeg"
+      raw_biogas_cost_eur_per_mwh_hs: 75.0
 
-    electricity_marginal_cost_eur_per_mwh:
-      full_eeg: 102.4
-      half_eeg: 146.0
-      no_eeg: 189.5
+      electricity_efficiency: 0.38
+      heat_efficiency: 0.45
 
-    heat_marginal_cost_eur_per_mwh: 0.0
+      # 75 / 0.38
+      merchant_electricity_marginal_cost_eur_per_mwh: 197.37
+
+      # 75 / 0.45
+      heat_marginal_cost_eur_per_mwh: 166.67
+
+      # Follow-on EEG modelling assumption
+      eeg_premium_eur_per_mwh: 87.06
+
+      # 197.37 - 87.06
+      supported_electricity_marginal_cost_eur_per_mwh: 110.31
+
+
+# -----------------------------------------------------------------------------
+# BIOGENIC CO2 SALES
+# -----------------------------------------------------------------------------
+co2_sale_cases:
+
+  none:
+    description: >
+      No economic value assigned to separated biogenic CO2.
+    active: false
+    sale_price_eur_per_t: 0.0
+    additional_cost_eur_per_t: 0.0
+    marketable_fraction: 1.0
+    co2_yield_t_per_mwh_biomethane: 0.12365
+
+  low_50:
+    description: >
+      CO2 valorisation sensitivity at 50 EUR/tCO2.
+    active: true
+    sale_price_eur_per_t: 50.0
+    additional_cost_eur_per_t: 0.0
+    marketable_fraction: 1.0
+    co2_yield_t_per_mwh_biomethane: 0.12365
+
+  medium_76_5:
+    description: >
+      CO2 valorisation sensitivity at 76.5 EUR/tCO2.
+    active: true
+    sale_price_eur_per_t: 76.5
+    additional_cost_eur_per_t: 0.0
+    marketable_fraction: 1.0
+    co2_yield_t_per_mwh_biomethane: 0.12365
+
+  high_144:
+    description: >
+      CO2 valorisation sensitivity at 144 EUR/tCO2.
+    active: true
+    sale_price_eur_per_t: 144.0
+    additional_cost_eur_per_t: 0.0
+    marketable_fraction: 1.0
+    co2_yield_t_per_mwh_biomethane: 0.12365
+
+# -----------------------------------------------------------------------------
+# BIOGAS.SH SUPPORT CASES
+# -----------------------------------------------------------------------------
+support_cases:
+
+  post_eeg:
+    description: >
+      Post-EEG market-only operation.
+      No follow-on EEG and no flexibilisation.
+
+    eeg_active: false
+    supported_hours_per_year: 0.0
+
+    flexibility_active: false
+    chp_capacity_multiplier: 1.0
+
+    flexibility_payment_eur_per_kw_year: 0.0
+
+
+  followon_eeg_no_flex:
+    description: >
+      Follow-on EEG support for existing CHP capacity,
+      without additional flexibilisation.
+
+    eeg_active: true
+    supported_hours_per_year: 2920.0
+
+    flexibility_active: false
+    chp_capacity_multiplier: 1.0
+
+    flexibility_payment_eur_per_kw_year: 0.0
+
+
+  followon_eeg_flex:
+    description: >
+      Follow-on EEG plus flexibilisation.
+      Electrical CHP capacity is represented as three times
+      the existing capacity while annual raw-biogas availability
+      remains unchanged.
+
+    eeg_active: true
+    supported_hours_per_year: 2920.0
+
+    flexibility_active: true
+    chp_capacity_multiplier: 3.0
+
+    # Used for reporting/economic interpretation.
+    # We do NOT make CHP capacity endogenous in this version.
+    flex_capex_eur_per_kw: 800.0
+    flex_lifetime_years: 15
+    flex_discount_rate: 0.05
+    flex_fixed_om_fraction: 0.02
+    flexibility_payment_eur_per_kw_year: 100.0
+
 
 # -----------------------------------------------------------------------------
 # HEAT-PUMP CASES
@@ -320,7 +702,7 @@ technical:
       upgrading: 0.96
 
     resource_constraint:
-      active: true
+      active: false #True
       ignore_missing_components: false
 
     public_grid_to_swfl:
@@ -330,7 +712,7 @@ technical:
 
     storage:
       active: true
-      energy_capacity_mwh: 500.0
+      energy_capacity_mwh: 500.0 #TODO: need to be checked against the documented 5,000 m³ storage
       initial_energy_mwh: 0.0
       cyclic: true
       standing_loss: 0.0
@@ -354,25 +736,29 @@ technical:
 # -----------------------------------------------------------------------------
 scenario_matrix:
   enabled: true
+
   dimensions:
+
+    support_case:
+      - "post_eeg"
+      - "followon_eeg_no_flex"
+      - "followon_eeg_flex"
+
     fossil_gas_price_case:
       - "low_2035"
       - "legacy_egon"
       - "high_2035"
       - "crisis_2035"
 
+    # All following dimensions are deliberately fixed.
     biomethane_price_case:
-      - "low_25"
-      - "medium_50"
-      - "cost_based_75"
+      - "project_92_9"
 
     heat_pump_case:
-      - "one_gwp1"
       - "two"
 
     swfl_unit_case:
       - "all_operational"
-      - "k12_k13_plus_gas_to_power"
 
     biomethane_use_case:
       - "k12_k13_only"

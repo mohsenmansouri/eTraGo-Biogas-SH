@@ -688,16 +688,20 @@ def load_shedding(
         marginal_cost = kwargs.get("marginal_cost", marginal_cost_def)
         p_nom = kwargs.get("p_nom", p_nom_def)
 
-        network.add("Carrier", "load")
-        start = (
+        if "load" not in network.carriers.index:
+            network.add("Carrier", "load")
+        else:
+            logger.debug("Carrier 'load' already exists; reusing it.")
+        numeric_ids = pd.to_numeric(
             network.generators.index.to_series()
-            .str.extract("(\d+)")
-            .astype(int)
-            .max()
-            + 1
-        )[0]
+            .astype(str)
+            .str.extract(r"(\d+)", expand=False),
+            errors="coerce",
+        )
 
-        if start != start:
+        if numeric_ids.notna().any():
+            start = int(numeric_ids.max()) + 1
+        else:
             start = 0
 
         index = list(range(start, start + len(network.buses.index)))
@@ -743,6 +747,255 @@ def load_shedding(
                 "Generator",
             )
 
+
+def restore_load_shedding_after_clustering(
+    etrago,
+    negative_load_shedding=("Li_ion",),
+):
+    """
+    Restore positive and negative load-shedding generators after
+    spatial clustering.
+
+    Spatial clustering can remove load-shedding generators while retaining
+    sector buses and stores. This is particularly problematic for Li-ion
+    battery buses, because their prescribed time-dependent energy bounds may
+    require the battery to discharge even when its ordinary network topology
+    only contains a charging link.
+
+    This function:
+
+    1. removes any surviving load-shedding generators,
+    2. recreates standard positive load shedding on all buses,
+    3. recreates negative load shedding on selected bus carriers,
+    4. validates that all selected buses have both forms available.
+
+    Parameters
+    ----------
+    etrago : Etrago
+        Active eTraGo object after spatial clustering.
+
+    negative_load_shedding : tuple or list of str
+        Bus carriers for which negative load shedding is required.
+        For eGon2035 battery stores this normally includes ``Li_ion``.
+
+    Returns
+    -------
+    dict
+        Diagnostic counts describing the restored generators.
+    """
+
+    if not etrago.args.get("load_shedding", False):
+        raise RuntimeError(
+            "args['load_shedding'] must be True before restoring "
+            "post-clustering load shedding."
+        )
+
+    network = etrago.network
+
+    shedding_carriers = {
+        "load shedding",
+        "negative load shedding",
+    }
+
+    # --------------------------------------------------------------
+    # Remove surviving shedding generators.
+    #
+    # We recreate all of them consistently below so that clustering
+    # cannot leave us with partial or duplicated coverage.
+    # --------------------------------------------------------------
+
+    generator_carrier = (
+        network.generators["carrier"]
+        .fillna("")
+        .astype(str)
+    )
+
+    existing_shedding = network.generators.index[
+        generator_carrier.isin(shedding_carriers)
+    ].tolist()
+
+    for generator_name in existing_shedding:
+        network.remove(
+            "Generator",
+            generator_name,
+        )
+
+    logger.info(
+        "Removed %s surviving load-shedding generators "
+        "before post-clustering restoration.",
+        len(existing_shedding),
+    )
+
+    # --------------------------------------------------------------
+    # Reuse the standard eTraGo load_shedding() implementation.
+    #
+    # Positive load shedding:
+    #     created on all buses.
+    #
+    # Negative load shedding:
+    #     created only on selected carriers such as Li_ion.
+    # --------------------------------------------------------------
+
+    load_shedding(
+        etrago,
+        negative_load_shedding=list(
+            negative_load_shedding
+        ),
+    )
+
+    # --------------------------------------------------------------
+    # Validate restored coverage
+    # --------------------------------------------------------------
+
+    buses = network.buses
+    generators = network.generators
+
+    required_bus_carriers = {
+        str(carrier)
+        for carrier in negative_load_shedding
+    }
+
+    protected_bus_mask = (
+        buses["carrier"]
+        .fillna("")
+        .astype(str)
+        .isin(required_bus_carriers)
+    )
+
+    protected_buses = set(
+        buses.index[
+            protected_bus_mask
+        ].astype(str)
+    )
+
+    if not protected_buses:
+
+        raise RuntimeError(
+            "No buses matching negative-load-shedding carriers "
+            f"{sorted(required_bus_carriers)} remain after clustering."
+        )
+
+    generator_bus = (
+        generators["bus"]
+        .fillna("")
+        .astype(str)
+    )
+
+    generator_carrier = (
+        generators["carrier"]
+        .fillna("")
+        .astype(str)
+    )
+
+    summary = {
+        "protected_buses": len(protected_buses),
+        "removed_existing_generators": len(
+            existing_shedding
+        ),
+    }
+
+    for shedding_carrier in [
+        "load shedding",
+        "negative load shedding",
+    ]:
+
+        carrier_mask = (
+            generator_carrier
+            == shedding_carrier
+        )
+
+        covered_buses = set(
+            generator_bus[
+                carrier_mask
+            ]
+        )
+
+        covered_protected_buses = (
+            protected_buses
+            & covered_buses
+        )
+
+        missing_buses = (
+            protected_buses
+            - covered_buses
+        )
+
+        summary[
+            f"{shedding_carrier} generators"
+        ] = int(
+            carrier_mask.sum()
+        )
+
+        summary[
+            f"{shedding_carrier} protected coverage"
+        ] = len(
+            covered_protected_buses
+        )
+
+        if missing_buses:
+
+            preview = sorted(
+                missing_buses
+            )[:20]
+
+            raise RuntimeError(
+                f"{shedding_carrier} is missing on "
+                f"{len(missing_buses)} protected buses. "
+                f"First missing bus IDs: {preview}"
+            )
+
+    # --------------------------------------------------------------
+    # Extra diagnostic for the IIS bus we identified.
+    # This is harmless and can be removed later.
+    # --------------------------------------------------------------
+
+    debug_bus = "79807"
+
+    if debug_bus in buses.index.astype(str):
+
+        debug_generators = generators[
+            generator_bus == debug_bus
+        ][
+            [
+                column
+                for column in [
+                    "bus",
+                    "carrier",
+                    "p_nom",
+                    "p_min_pu",
+                    "p_max_pu",
+                    "marginal_cost",
+                ]
+                if column in generators.columns
+            ]
+        ]
+
+        logger.info(
+            "\n"
+            "POST-CLUSTERING SHEDDING AT IIS BUS 79807\n"
+            "--------------------------------------------------\n%s",
+            debug_generators.to_string(),
+        )
+
+    logger.info(
+        "\n"
+        "POST-CLUSTERING LOAD SHEDDING RESTORED\n"
+        "--------------------------------------------------\n"
+        "Li-ion/protected buses:            %s\n"
+        "removed old shedding generators:   %s\n"
+        "positive shedding generators:      %s\n"
+        "negative shedding generators:      %s\n"
+        "positive protected coverage:       %s\n"
+        "negative protected coverage:       %s\n",
+        summary["protected_buses"],
+        summary["removed_existing_generators"],
+        summary["load shedding generators"],
+        summary["negative load shedding generators"],
+        summary["load shedding protected coverage"],
+        summary["negative load shedding protected coverage"],
+    )
+
+    return summary
 
 def set_control_strategies(network):
     """Sets control strategies for AC generators and storage units

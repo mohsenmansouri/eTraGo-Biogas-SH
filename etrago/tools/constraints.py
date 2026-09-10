@@ -3706,27 +3706,46 @@ class Constraints:
                     logger.info(
                         "Added extra_functionality {}".format(constraint)
                     )
-                except:
+                except Exception:
+                    if str(
+                            constraint
+                    ).startswith(
+                        "biogas_sh_"
+                    ):
+                        raise
+
                     logger.warning(
-                        "Constraint {} not defined".format(constraint)
-                        + ". New constraints can be defined in"
-                        + " etrago/tools/constraint.py."
+                        "Constraint {} not defined".format(
+                            constraint
+                        )
                     )
             elif self.args["method"]["formulation"] == "linopy":
                 try:
                     eval(
                         "_" + constraint + "_linopy(self, network, snapshots)"
                     )
+
                     logger.info(
-                        "Added extra_functionality {}".format(constraint)
+                        "Added extra_functionality {}".format(
+                            constraint
+                        )
                     )
-                except:
+
+                except Exception:
+
+                    # Biogas.SH constraints are essential.
+                    # Never silently continue if one of them fails.
+                    if str(constraint).startswith(
+                            "biogas_sh_"
+                    ):
+                        raise
+
                     logger.warning(
                         "Constraint {} not defined for linopy formulation".format(
                             constraint
                         )
-                        + ". New constraints can be defined in"
-                        + " etrago/tools/constraint.py."
+                        + ". New constraints can be defined in "
+                        + "etrago/tools/constraint.py."
                     )
             else:
                 try:
@@ -4367,6 +4386,9 @@ def _get_clustered_biogas_sh_generators(network):
         [
             "biogas_sh_onsite_el",
             "biogas_sh_onsite_chp_el",
+
+            "biogas_sh_onsite_el_supported",
+            "biogas_sh_onsite_chp_el_supported",
         ]
     )
 
@@ -4405,6 +4427,55 @@ def _get_clustered_biogas_sh_generators(network):
         heat_generators,
         ch4_generators,
     )
+
+
+def _get_clustered_biogas_sh_electricity_tranches(
+    network,
+):
+    """
+    Identify merchant and EEG-supported Biogas.SH electricity
+    generators after clustering.
+    """
+
+    generators = network.generators
+
+    carrier = (
+        generators["carrier"]
+        .astype(str)
+    )
+
+    market_mask = carrier.isin(
+        [
+            "biogas_sh_onsite_el",
+            "biogas_sh_onsite_chp_el",
+        ]
+    )
+
+    supported_mask = carrier.isin(
+        [
+            "biogas_sh_onsite_el_supported",
+            "biogas_sh_onsite_chp_el_supported",
+        ]
+    )
+
+    market = (
+        generators.index[
+            market_mask
+        ]
+        .astype(str)
+        .tolist()
+    )
+
+    supported = (
+        generators.index[
+            supported_mask
+        ]
+        .astype(str)
+        .tolist()
+    )
+
+    return market, supported
+
 
 def _biogas_sh_resource(self, network, snapshots):
     """
@@ -4616,6 +4687,508 @@ def _biogas_sh_resource(self, network, snapshots):
         ),
     )
 
+def _biogas_sh_support(
+    self,
+    network,
+    snapshots,
+):
+    """
+    Pyomo constraints for simplified Biogas.SH follow-on EEG.
+
+    Two parallel generator tranches are used:
+
+        merchant electricity
+        supported electricity
+
+    The constraints ensure:
+
+    1. Both tranches share the same physical CHP capacity.
+    2. Supported electricity is limited to the configured
+       equivalent full-load hours.
+    """
+
+    import pandas as pd
+    from pyomo.environ import ConstraintList
+
+    arg = self.args[
+        "extra_functionality"
+    ]["biogas_sh_support"]
+
+    if not bool(
+        arg.get(
+            "active",
+            False,
+        )
+    ):
+        return
+
+    supported_hours_per_year = float(
+        arg.get(
+            "supported_hours_per_year",
+            0.0,
+        )
+    )
+
+    ignore_missing = bool(
+        arg.get(
+            "ignore_missing_components",
+            False,
+        )
+    )
+
+    (
+        market_generators,
+        supported_generators,
+    ) = (
+        _get_clustered_biogas_sh_electricity_tranches(
+            network
+        )
+    )
+
+    if not supported_generators:
+        message = (
+            "EEG support is active but no supported "
+            "Biogas.SH electricity generators were found."
+        )
+
+        if ignore_missing:
+            print("WARNING: " + message)
+            return
+
+        raise ValueError(message)
+
+    snapshots = pd.Index(
+        snapshots
+    )
+
+    weights = (
+        network.snapshot_weightings.generators
+        .reindex(snapshots)
+        .astype(float)
+    )
+
+    if weights.isna().any():
+        raise ValueError(
+            "Missing snapshot weights in "
+            "Biogas.SH support constraint."
+        )
+
+    represented_hours = float(
+        weights.sum()
+    )
+
+    effective_supported_hours = (
+        supported_hours_per_year
+        * represented_hours
+        / 8760.0
+    )
+
+    # Group generators by clustered AC bus.
+    market_by_bus = {}
+
+    for generator in market_generators:
+        bus = str(
+            network.generators.at[
+                generator,
+                "bus",
+            ]
+        )
+
+        market_by_bus.setdefault(
+            bus,
+            [],
+        ).append(
+            generator
+        )
+
+    supported_by_bus = {}
+
+    for generator in supported_generators:
+        bus = str(
+            network.generators.at[
+                generator,
+                "bus",
+            ]
+        )
+
+        supported_by_bus.setdefault(
+            bus,
+            [],
+        ).append(
+            generator
+        )
+
+    model = network.model
+
+    model.biogas_sh_shared_chp_capacity = (
+        ConstraintList()
+    )
+
+    model.biogas_sh_supported_energy = (
+        ConstraintList()
+    )
+
+    for bus in sorted(
+        supported_by_bus
+    ):
+
+        supported_ids = (
+            supported_by_bus[
+                bus
+            ]
+        )
+
+        market_ids = (
+            market_by_bus.get(
+                bus,
+                [],
+            )
+        )
+
+        if not market_ids:
+            raise ValueError(
+                "Supported Biogas.SH electricity exists "
+                f"at bus {bus}, but no merchant tranche "
+                "was found at the same bus."
+            )
+
+        physical_capacity_mw = float(
+            network.generators.loc[
+                market_ids,
+                "p_nom",
+            ].sum()
+        )
+
+        supported_capacity_mw = float(
+            network.generators.loc[
+                supported_ids,
+                "p_nom",
+            ].sum()
+        )
+
+        if not np.isclose(
+            physical_capacity_mw,
+            supported_capacity_mw,
+            rtol=1e-6,
+            atol=1e-8,
+        ):
+            raise ValueError(
+                "Merchant and supported Biogas.SH CHP "
+                f"capacity differ at bus {bus}: "
+                f"{physical_capacity_mw} vs "
+                f"{supported_capacity_mw} MW."
+            )
+
+        # --------------------------------------------------
+        # Hourly shared physical CHP capacity
+        # --------------------------------------------------
+        for snapshot in snapshots:
+
+            model.biogas_sh_shared_chp_capacity.add(
+
+                sum(
+                    model.generator_p[
+                        generator,
+                        snapshot,
+                    ]
+                    for generator
+                    in market_ids
+                )
+
+                +
+
+                sum(
+                    model.generator_p[
+                        generator,
+                        snapshot,
+                    ]
+                    for generator
+                    in supported_ids
+                )
+
+                <= physical_capacity_mw
+            )
+
+        # --------------------------------------------------
+        # Supported-energy limit
+        # --------------------------------------------------
+        supported_energy = sum(
+
+            model.generator_p[
+                generator,
+                snapshot,
+            ]
+            * float(
+                weights.loc[
+                    snapshot
+                ]
+            )
+
+            for generator
+            in supported_ids
+
+            for snapshot
+            in snapshots
+        )
+
+        model.biogas_sh_supported_energy.add(
+
+            supported_energy
+
+            <=
+
+            physical_capacity_mw
+            * effective_supported_hours
+        )
+
+    print(
+        "\nBiogas.SH EEG support constraints"
+    )
+
+    print(
+        f"  supported hours/year:      "
+        f"{supported_hours_per_year:.3f}"
+    )
+
+    print(
+        f"  represented hours:         "
+        f"{represented_hours:.3f}"
+    )
+
+    print(
+        f"  effective support hours:   "
+        f"{effective_supported_hours:.3f}"
+    )
+
+    print(
+        f"  clustered CHP buses:       "
+        f"{len(supported_by_bus)}"
+    )
+
+
+def _biogas_sh_support_linopy(
+    self,
+    network,
+    snapshots,
+):
+    """
+    Linopy version of the Biogas.SH follow-on EEG constraints.
+    """
+
+    import pandas as pd
+
+    arg = self.args[
+        "extra_functionality"
+    ]["biogas_sh_support"]
+
+    if not bool(
+        arg.get(
+            "active",
+            False,
+        )
+    ):
+        return
+
+    supported_hours_per_year = float(
+        arg.get(
+            "supported_hours_per_year",
+            0.0,
+        )
+    )
+
+    (
+        market_generators,
+        supported_generators,
+    ) = (
+        _get_clustered_biogas_sh_electricity_tranches(
+            network
+        )
+    )
+
+    if not supported_generators:
+        raise ValueError(
+            "EEG support is active but no supported "
+            "Biogas.SH generators were found."
+        )
+
+    snapshots = pd.Index(
+        snapshots
+    )
+
+    weights = (
+        network.snapshot_weightings.generators
+        .reindex(snapshots)
+        .astype(float)
+    )
+
+    represented_hours = float(
+        weights.sum()
+    )
+
+    effective_supported_hours = (
+        supported_hours_per_year
+        * represented_hours
+        / 8760.0
+    )
+
+    market_by_bus = {}
+
+    for generator in market_generators:
+
+        bus = str(
+            network.generators.at[
+                generator,
+                "bus",
+            ]
+        )
+
+        market_by_bus.setdefault(
+            bus,
+            [],
+        ).append(
+            generator
+        )
+
+    supported_by_bus = {}
+
+    for generator in supported_generators:
+
+        bus = str(
+            network.generators.at[
+                generator,
+                "bus",
+            ]
+        )
+
+        supported_by_bus.setdefault(
+            bus,
+            [],
+        ).append(
+            generator
+        )
+
+    gen_p = get_var(
+        network,
+        "Generator",
+        "p",
+    )
+
+    for bus_number, bus in enumerate(
+        sorted(
+            supported_by_bus
+        )
+    ):
+
+        supported_ids = (
+            supported_by_bus[
+                bus
+            ]
+        )
+
+        market_ids = (
+            market_by_bus.get(
+                bus,
+                [],
+            )
+        )
+
+        if not market_ids:
+            raise ValueError(
+                f"No merchant CHP tranche at bus {bus}."
+            )
+
+        physical_capacity_mw = float(
+            network.generators.loc[
+                market_ids,
+                "p_nom",
+            ].sum()
+        )
+
+        supported_capacity_mw = float(
+            network.generators.loc[
+                supported_ids,
+                "p_nom",
+            ].sum()
+        )
+
+        if not np.isclose(
+            physical_capacity_mw,
+            supported_capacity_mw,
+            rtol=1e-6,
+            atol=1e-8,
+        ):
+            raise ValueError(
+                "Merchant and supported capacity differ "
+                f"at bus {bus}."
+            )
+
+        # Hourly capacity.
+        for snapshot_number, snapshot in enumerate(
+            snapshots
+        ):
+
+            lhs = (
+                gen_p.loc[
+                    snapshot,
+                    market_ids,
+                ].sum()
+
+                +
+
+                gen_p.loc[
+                    snapshot,
+                    supported_ids,
+                ].sum()
+            )
+
+            define_constraints(
+                network,
+                lhs,
+                "<=",
+                physical_capacity_mw,
+                "Generator",
+                (
+                    "biogas_sh_shared_chp_"
+                    f"{bus_number}_"
+                    f"{snapshot_number}"
+                ),
+            )
+
+        supported_energy = 0
+
+        for snapshot in snapshots:
+
+            supported_energy = (
+                supported_energy
+
+                +
+
+                gen_p.loc[
+                    snapshot,
+                    supported_ids,
+                ].sum()
+
+                * float(
+                    weights.loc[
+                        snapshot
+                    ]
+                )
+            )
+
+        define_constraints(
+            network,
+            supported_energy,
+            "<=",
+            (
+                physical_capacity_mw
+                * effective_supported_hours
+            ),
+            "Generator",
+            (
+                "biogas_sh_supported_energy_"
+                f"{bus_number}"
+            ),
+        )
 
 
 def _biogas_sh_resource_linopy(
@@ -4626,26 +5199,47 @@ def _biogas_sh_resource_linopy(
     """
     Linopy version of the regional Biogas.SH raw-biogas constraint.
 
-    This version is robust to component aggregation during clustering.
+    The constraint limits the total raw-biogas use across all available
+    Biogas.SH routes:
+
+        onsite electricity / eta_el
+        + onsite heat / eta_heat
+        + biomethane production / eta_upgrade
+        <= available raw-biogas resource
+
+    Snapshot weights are applied explicitly because Linopy Variable
+    objects do not support pandas .mul().
     """
+
     import pandas as pd
 
     arg = self.args[
         "extra_functionality"
     ]["biogas_sh_resource"]
 
-    df = pd.read_csv(arg["csv_path"])
+    df = pd.read_csv(
+        arg["csv_path"]
+    )
 
     eta_el = float(
-        arg.get("eta_el", 0.38)
+        arg.get(
+            "eta_el",
+            0.38,
+        )
     )
 
     eta_heat = float(
-        arg.get("eta_heat", 0.45)
+        arg.get(
+            "eta_heat",
+            0.45,
+        )
     )
 
     eta_upgrade = float(
-        arg.get("eta_upgrade", 0.96)
+        arg.get(
+            "eta_upgrade",
+            0.96,
+        )
     )
 
     ignore_missing = bool(
@@ -4655,31 +5249,71 @@ def _biogas_sh_resource_linopy(
         )
     )
 
-    snapshots = pd.Index(snapshots)
+    snapshots = pd.Index(
+        snapshots
+    )
 
+    # --------------------------------------------------------------
+    # Snapshot weights
+    # --------------------------------------------------------------
     weights = (
         network.snapshot_weightings.generators
-        .reindex(snapshots)
-        .astype(float)
+        .reindex(
+            snapshots
+        )
+        .astype(
+            float
+        )
     )
 
     if weights.isna().any():
+        missing_snapshots = (
+            weights.index[
+                weights.isna()
+            ].tolist()
+        )
+
         raise ValueError(
             "Missing generator snapshot weights in "
-            "Biogas.SH resource constraint."
+            "Biogas.SH resource constraint for "
+            f"snapshots: {missing_snapshots}"
         )
 
     represented_hours = float(
         weights.sum()
     )
 
+    if represented_hours <= 0:
+        raise ValueError(
+            "The represented number of hours in the "
+            "Biogas.SH resource constraint must be positive."
+        )
+
+    # --------------------------------------------------------------
+    # Annual raw-biogas resource from plant CSV
+    # --------------------------------------------------------------
+    if (
+        "raw_biogas_mwh_hs_a"
+        not in df.columns
+    ):
+        raise ValueError(
+            "Biogas.SH CSV is missing required column "
+            "'raw_biogas_mwh_hs_a'."
+        )
+
     annual_raw_biogas_mwh = float(
         pd.to_numeric(
-            df["raw_biogas_mwh_hs_a"],
+            df[
+                "raw_biogas_mwh_hs_a"
+            ],
             errors="coerce",
         )
-        .fillna(0.0)
-        .clip(lower=0.0)
+        .fillna(
+            0.0
+        )
+        .clip(
+            lower=0.0
+        )
         .sum()
     )
 
@@ -4689,6 +5323,9 @@ def _biogas_sh_resource_linopy(
         / 8760.0
     )
 
+    # --------------------------------------------------------------
+    # Identify Biogas.SH generators after clustering
+    # --------------------------------------------------------------
     (
         electricity_generators,
         heat_generators,
@@ -4713,87 +5350,108 @@ def _biogas_sh_resource_linopy(
             )
             return
 
-        raise ValueError(message)
+        raise ValueError(
+            message
+        )
 
+    if not ch4_generators:
+        message = (
+            "No custom Biogas.SH CH4 generators were found "
+            "after clustering."
+        )
+
+        if ignore_missing:
+            print(
+                "WARNING: " + message
+            )
+        else:
+            raise ValueError(
+                message
+            )
+
+    # --------------------------------------------------------------
+    # Linopy Generator dispatch variable
+    # --------------------------------------------------------------
     gen_p = get_var(
         network,
         "Generator",
         "p",
     )
 
-    terms = []
+    expression = 0
 
+    # --------------------------------------------------------------
+    # Onsite electricity
+    #
+    # Includes BOTH merchant and EEG-supported tranches because
+    # _get_clustered_biogas_sh_generators() identifies both carriers.
+    # --------------------------------------------------------------
     if electricity_generators:
-        terms.append(
-            gen_p.loc[
-                snapshots,
-                electricity_generators,
-            ]
-            .mul(
-                weights,
-                axis=0,
-            )
-            .sum()
-            / eta_el
-        )
 
+        for snapshot in snapshots:
+
+            expression = (
+                expression
+                +
+                gen_p.loc[
+                    snapshot,
+                    electricity_generators,
+                ].sum()
+                * float(
+                    weights.loc[
+                        snapshot
+                    ]
+                )
+                / eta_el
+            )
+
+    # --------------------------------------------------------------
+    # Onsite heat
+    # --------------------------------------------------------------
     if heat_generators:
-        terms.append(
-            gen_p.loc[
-                snapshots,
-                heat_generators,
-            ]
-            .mul(
-                weights,
-                axis=0,
-            )
-            .sum()
-            / eta_heat
-        )
 
+        for snapshot in snapshots:
+
+            expression = (
+                expression
+                +
+                gen_p.loc[
+                    snapshot,
+                    heat_generators,
+                ].sum()
+                * float(
+                    weights.loc[
+                        snapshot
+                    ]
+                )
+                / eta_heat
+            )
+
+    # --------------------------------------------------------------
+    # Central biomethane production
+    # --------------------------------------------------------------
     if ch4_generators:
-        terms.append(
-            gen_p.loc[
-                snapshots,
-                ch4_generators,
-            ]
-            .mul(
-                weights,
-                axis=0,
+
+        for snapshot in snapshots:
+
+            expression = (
+                expression
+                +
+                gen_p.loc[
+                    snapshot,
+                    ch4_generators,
+                ].sum()
+                * float(
+                    weights.loc[
+                        snapshot
+                    ]
+                )
+                / eta_upgrade
             )
-            .sum()
-            / eta_upgrade
-        )
 
-    expression = terms[0]
-
-    for term in terms[1:]:
-        expression = expression + term
-
-    print(
-        "\nBiogas.SH regional resource constraint"
-    )
-    print(
-        f"  represented hours:          "
-        f"{represented_hours:.3f}"
-    )
-    print(
-        f"  period raw resource limit:  "
-        f"{raw_limit_mwh:.3f} MWh_Hs"
-    )
-    print(
-        f"  onsite electricity gens:    "
-        f"{len(electricity_generators)}"
-    )
-    print(
-        f"  onsite heat generators:     "
-        f"{len(heat_generators)}"
-    )
-    print(
-        f"  custom CH4 generators:      "
-        f"{len(ch4_generators)}"
-    )
-
+    # --------------------------------------------------------------
+    # Add regional raw-biogas constraint
+    # --------------------------------------------------------------
     define_constraints(
         network,
         expression,
@@ -4803,16 +5461,51 @@ def _biogas_sh_resource_linopy(
         "biogas_sh_resource_regional",
     )
 
+    # --------------------------------------------------------------
+    # Diagnostics
+    # --------------------------------------------------------------
+    print(
+        "\nBiogas.SH regional resource constraint"
+    )
 
-def _biogas_sh_resource_nmp(
+    print(
+        f"  represented hours:          "
+        f"{represented_hours:.3f}"
+    )
+
+    print(
+        f"  annual raw resource:        "
+        f"{annual_raw_biogas_mwh:.3f} MWh_Hs/a"
+    )
+
+    print(
+        f"  period raw resource limit:  "
+        f"{raw_limit_mwh:.3f} MWh_Hs"
+    )
+
+    print(
+        f"  onsite electricity gens:    "
+        f"{len(electricity_generators)}"
+    )
+
+    print(
+        f"  onsite heat generators:     "
+        f"{len(heat_generators)}"
+    )
+
+    print(
+        f"  custom CH4 generators:      "
+        f"{len(ch4_generators)}"
+    )
+
+
+def _biogas_sh_support_nmp(
     self,
     network,
     snapshots,
 ):
-    """Non-Pyomo fallback using the Linopy implementation."""
-    _biogas_sh_resource_linopy(
+    _biogas_sh_support_linopy(
         self,
         network,
         snapshots,
     )
-

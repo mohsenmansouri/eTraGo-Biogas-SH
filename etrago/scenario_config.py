@@ -72,8 +72,14 @@ def _selection_with_environment_overrides(
         "fossil_gas_price_case": (
             "ETRAGO_FOSSIL_GAS_PRICE_CASE"
         ),
+        "support_case": (
+            "ETRAGO_SUPPORT_CASE"
+        ),
         "biomethane_price_case": (
             "ETRAGO_BIOMETHANE_PRICE_CASE"
+        ),
+        "co2_sale_case": (
+            "ETRAGO_CO2_SALE_CASE"
         ),
         "heat_pump_case": "ETRAGO_HEAT_PUMP_CASE",
         "swfl_unit_case": "ETRAGO_SWFL_UNIT_CASE",
@@ -97,11 +103,13 @@ def _validate_selection(
 ) -> None:
     required_dimensions = (
         "fossil_gas_price_case",
+        "support_case",
         "biomethane_price_case",
         "heat_pump_case",
         "swfl_unit_case",
         "biomethane_use_case",
         "biogas_route_case",
+        "co2_sale_case",
     )
     missing = [key for key in required_dimensions if key not in selection]
     if missing:
@@ -136,6 +144,94 @@ def _validate_selection(
         "biomethane_use_cases",
         selection["biomethane_use_case"],
     )
+    support_case = _named_case(
+        config,
+        "support_cases",
+        selection["support_case"],
+    )
+
+    # Validate support-policy parameters.
+    eeg_active = bool(
+        support_case.get(
+            "eeg_active",
+            False,
+        )
+    )
+    flexibility_active = bool(
+        support_case.get(
+            "flexibility_active",
+            False,
+        )
+    )
+    supported_hours = float(
+        support_case.get(
+            "supported_hours_per_year",
+            0.0,
+        )
+    )
+    capacity_multiplier = float(
+        support_case.get(
+            "chp_capacity_multiplier",
+            1.0,
+        )
+    )
+    flexibility_payment = float(
+        support_case.get(
+            "flexibility_payment_eur_per_kw_year",
+            0.0,
+        )
+    )
+
+    if capacity_multiplier <= 0:
+        raise ScenarioConfigError(
+            "support_case.chp_capacity_multiplier "
+            "must be greater than zero."
+        )
+
+    if supported_hours < 0:
+        raise ScenarioConfigError(
+            "support_case.supported_hours_per_year "
+            "must be non-negative."
+        )
+
+    if eeg_active and supported_hours <= 0:
+        raise ScenarioConfigError(
+            "An active EEG support case must define "
+            "supported_hours_per_year > 0."
+        )
+
+    if not eeg_active and supported_hours != 0:
+        raise ScenarioConfigError(
+            "A support case with eeg_active=false must set "
+            "supported_hours_per_year to 0."
+        )
+
+    if flexibility_payment < 0:
+        raise ScenarioConfigError(
+            "support_case.flexibility_payment_eur_per_kw_year "
+            "must be non-negative."
+        )
+
+    if flexibility_active:
+        if float(support_case.get("flex_capex_eur_per_kw", 0.0)) <= 0:
+            raise ScenarioConfigError(
+                "A flexibility case must define "
+                "flex_capex_eur_per_kw > 0."
+            )
+        if float(support_case.get("flex_lifetime_years", 0.0)) <= 0:
+            raise ScenarioConfigError(
+                "A flexibility case must define "
+                "flex_lifetime_years > 0."
+            )
+        if float(support_case.get("flex_discount_rate", 0.0)) < 0:
+            raise ScenarioConfigError(
+                "flex_discount_rate must be non-negative."
+            )
+        if float(support_case.get("flex_fixed_om_fraction", 0.0)) < 0:
+            raise ScenarioConfigError(
+                "flex_fixed_om_fraction must be non-negative."
+            )
+
     route_case = _named_case(
         config,
         "biogas_route_cases",
@@ -261,10 +357,15 @@ def resolve_config(
     selection = _selection_with_environment_overrides(
         config
     )
+
     _validate_selection(
         config,
         selection,
     )
+
+    # ============================================================
+    # PRICE CASES
+    # ============================================================
 
     price_cases = _require_mapping(
         config,
@@ -290,52 +391,89 @@ def resolve_config(
         "price_cases",
     )
 
-    onsite_electricity_cases = _require_mapping(
-        onsite,
-        "electricity_marginal_cost_eur_per_mwh",
-        "price_cases.onsite",
+    # ============================================================
+    # CO2 SALE CASE
+    # ============================================================
+
+    co2_sale = _named_case(
+        config,
+        "co2_sale_cases",
+        selection["co2_sale_case"],
     )
 
-    onsite_case = str(
-        _require(
-            onsite,
-            "selected_electricity_case",
-            "price_cases.onsite",
-        )
+    # ============================================================
+    # SUPPORT CASE
+    # ============================================================
+
+    support = _named_case(
+        config,
+        "support_cases",
+        selection["support_case"],
     )
 
-    if onsite_case not in onsite_electricity_cases:
+    # ============================================================
+    # ONSITE BIOGAS COSTS
+    # ============================================================
+
+    raw_biogas_cost = float(
+        onsite[
+            "raw_biogas_cost_eur_per_mwh_hs"
+        ]
+    )
+
+    onsite_el_efficiency = float(
+        onsite[
+            "electricity_efficiency"
+        ]
+    )
+
+    onsite_heat_efficiency = float(
+        onsite[
+            "heat_efficiency"
+        ]
+    )
+
+    merchant_el_cost = float(
+        onsite[
+            "merchant_electricity_marginal_cost_eur_per_mwh"
+        ]
+    )
+
+    onsite_heat_cost = float(
+        onsite[
+            "heat_marginal_cost_eur_per_mwh"
+        ]
+    )
+
+    eeg_premium = float(
+        onsite[
+            "eeg_premium_eur_per_mwh"
+        ]
+    )
+
+    supported_el_cost = (
+        merchant_el_cost
+        - eeg_premium
+    )
+
+    if supported_el_cost < 0:
         raise ScenarioConfigError(
-            "Unknown onsite electricity-price case: "
-            f"{onsite_case}"
+            "The EEG premium produces a negative supported "
+            "electricity marginal cost. "
+            "Check price_cases.onsite."
         )
 
-    try:
-        for case_name, value in onsite_electricity_cases.items():
-            float(value)
+    # ============================================================
+    # FOSSIL NATURAL-GAS COST
+    # ============================================================
 
-        float(
-            _require(
-                onsite,
-                "heat_marginal_cost_eur_per_mwh",
-                "price_cases.onsite",
-            )
-        )
-    except (TypeError, ValueError) as exc:
-        raise ScenarioConfigError(
-            "All onsite marginal costs must be numeric."
-        ) from exc
-
-    # --------------------------------------------------------
-    # Carbon-inclusive fossil natural-gas cost
-    # --------------------------------------------------------
     gas_commodity_price = float(
         fossil_gas[
             "gas_commodity_price_eur_per_mwh_fuel"
         ]
     )
 
-    co2_price = float(
+    fossil_co2_price = float(
         fossil_gas[
             "co2_price_eur_per_tco2"
         ]
@@ -348,7 +486,7 @@ def resolve_config(
     )
 
     co2_cost_on_gas = (
-        co2_price
+        fossil_co2_price
         * emission_factor
     )
 
@@ -364,9 +502,145 @@ def resolve_config(
         )
     )
 
+    # ============================================================
+    # BIOMETHANE BASE COST
+    # ============================================================
+
+    biomethane_base_cost = float(
+        biomethane[
+            "marginal_cost_eur_per_mwh_hs"
+        ]
+    )
+
+    # ============================================================
+    # BIOGENIC CO2 SALE
+    # ============================================================
+    #
+    # CO2 sale is represented as a revenue credit on biomethane
+    # production.
+    #
+    # Example:
+    #
+    #   CO2 yield = 0.12365 tCO2 / MWh_Hs biomethane
+    #   CO2 price = 60 EUR/tCO2
+    #
+    #   revenue credit =
+    #       0.12365 * 60
+    #       = 7.419 EUR/MWh_Hs biomethane
+    #
+    #   effective biomethane cost =
+    #       92.9 - 7.419
+    #       = 85.481 EUR/MWh_Hs
+    #
+    # ============================================================
+
+    co2_sale_active = bool(
+        co2_sale.get(
+            "active",
+            False,
+        )
+    )
+
+    co2_sale_price = float(
+        co2_sale.get(
+            "sale_price_eur_per_t",
+            0.0,
+        )
+    )
+
+    co2_additional_cost = float(
+        co2_sale.get(
+            "additional_cost_eur_per_t",
+            0.0,
+        )
+    )
+
+    co2_marketable_fraction = float(
+        co2_sale.get(
+            "marketable_fraction",
+            1.0,
+        )
+    )
+
+    co2_yield = float(
+        co2_sale.get(
+            "co2_yield_t_per_mwh_biomethane",
+            0.0,
+        )
+    )
+
+    # ------------------------------------------------------------
+    # Basic validation
+    # ------------------------------------------------------------
+
+    if not 0.0 <= co2_marketable_fraction <= 1.0:
+        raise ScenarioConfigError(
+            "co2_sale_cases."
+            f"{selection['co2_sale_case']}."
+            "marketable_fraction must be between 0 and 1."
+        )
+
+    if co2_sale_price < 0:
+        raise ScenarioConfigError(
+            "CO2 sale price cannot be negative."
+        )
+
+    if co2_additional_cost < 0:
+        raise ScenarioConfigError(
+            "CO2 additional cost cannot be negative."
+        )
+
+    if co2_yield < 0:
+        raise ScenarioConfigError(
+            "CO2 yield cannot be negative."
+        )
+
+    # ------------------------------------------------------------
+    # CO2 revenue calculation
+    # ------------------------------------------------------------
+
+    if co2_sale_active:
+
+        co2_net_sale_price = (
+            co2_sale_price
+            - co2_additional_cost
+        )
+
+        co2_revenue_credit = (
+            co2_yield
+            * co2_marketable_fraction
+            * co2_net_sale_price
+        )
+
+    else:
+
+        co2_net_sale_price = 0.0
+        co2_revenue_credit = 0.0
+
+    # ------------------------------------------------------------
+    # Effective biomethane marginal cost
+    # ------------------------------------------------------------
+
+    biomethane_effective_cost = (
+        biomethane_base_cost
+        - co2_revenue_credit
+    )
+
+    if biomethane_effective_cost < 0:
+        raise ScenarioConfigError(
+            "CO2 sales revenue produces a negative effective "
+            "biomethane marginal cost. Check the CO2 assumptions."
+        )
+
+    # ============================================================
+    # SCENARIO NAME
+    # ============================================================
+
     ordered_dimensions = (
+        "support_case",
         "fossil_gas_price_case",
         "biomethane_price_case",
+        "co2_sale_case",
         "heat_pump_case",
         "swfl_unit_case",
         "biomethane_use_case",
@@ -378,63 +652,159 @@ def resolve_config(
         for key in ordered_dimensions
     )
 
+    # ============================================================
+    # RESOLVED CONFIGURATION
+    # ============================================================
+
     return {
         "config_version": CONFIG_VERSION,
+
         "scenario_name": scenario_name,
+
         "selection": selection,
+
         "prices": {
+
+            # ----------------------------------------------------
+            # Fossil natural gas
+            # ----------------------------------------------------
+
             "gas_commodity_price_eur_per_mwh_fuel": (
                 gas_commodity_price
             ),
+
             "co2_price_eur_per_tco2": (
-                co2_price
+                fossil_co2_price
             ),
+
             "emission_factor_tco2_per_mwh_fuel": (
                 emission_factor
             ),
+
             "co2_cost_on_gas_eur_per_mwh_fuel": (
                 co2_cost_on_gas
             ),
+
             "final_ch4_ng_marginal_cost_eur_per_mwh_fuel": (
                 final_ch4_ng_cost
             ),
+
             "swfl_import_adder_eur_per_mwh_fuel": (
                 swfl_import_adder
             ),
+
             "gas_source": str(
                 fossil_gas.get(
                     "gas_source",
                     "",
                 )
             ),
+
             "co2_source": str(
                 fossil_gas.get(
                     "co2_source",
                     "",
                 )
             ),
+
             "gas_value_status": str(
                 fossil_gas.get(
                     "gas_value_status",
                     "",
                 )
             ),
-            "biomethane_marginal_cost_eur_per_mwh_hs": float(
-                biomethane[
-                    "marginal_cost_eur_per_mwh_hs"
-                ]
+
+            # ----------------------------------------------------
+            # Biomethane
+            # ----------------------------------------------------
+
+            "biomethane_base_cost_eur_per_mwh_hs": (
+                biomethane_base_cost
             ),
-            "onsite_electricity_marginal_cost_eur_per_mwh": float(
-                onsite_electricity_cases[
-                    onsite_case
-                ]
+
+            "biomethane_marginal_cost_eur_per_mwh_hs": (
+                biomethane_effective_cost
             ),
-            "onsite_heat_marginal_cost_eur_per_mwh": float(
-                onsite[
-                    "heat_marginal_cost_eur_per_mwh"
-                ]
+
+            # ----------------------------------------------------
+            # Biogenic CO2 sale
+            # ----------------------------------------------------
+
+            "co2_sale_active": (
+                co2_sale_active
+            ),
+
+            "co2_sale_price_eur_per_t": (
+                co2_sale_price
+            ),
+
+            "co2_additional_cost_eur_per_t": (
+                co2_additional_cost
+            ),
+
+            "co2_net_sale_price_eur_per_t": (
+                co2_net_sale_price
+            ),
+
+            "co2_yield_t_per_mwh_biomethane": (
+                co2_yield
+            ),
+
+            "co2_marketable_fraction": (
+                co2_marketable_fraction
+            ),
+
+            "co2_revenue_credit_eur_per_mwh_biomethane": (
+                co2_revenue_credit
+            ),
+
+            # ----------------------------------------------------
+            # Raw biogas / onsite CHP
+            # ----------------------------------------------------
+
+            "raw_biogas_cost_eur_per_mwh_hs": (
+                raw_biogas_cost
+            ),
+
+            "onsite_electricity_marginal_cost_eur_per_mwh": (
+                merchant_el_cost
+            ),
+
+            "onsite_supported_electricity_marginal_cost_eur_per_mwh": (
+                supported_el_cost
+            ),
+
+            "onsite_heat_marginal_cost_eur_per_mwh": (
+                onsite_heat_cost
+            ),
+
+            "eeg_premium_eur_per_mwh": (
+                eeg_premium
             ),
         },
+
+        # ========================================================
+        # SUPPORT
+        # ========================================================
+
+        "support": {
+            "case": selection["support_case"],
+            **copy.deepcopy(support),
+        },
+
+        # ========================================================
+        # CO2 SALE CASE
+        # ========================================================
+
+        "co2_sale": {
+            "case": selection["co2_sale_case"],
+            **copy.deepcopy(co2_sale),
+        },
+
+        # ========================================================
+        # HEAT PUMPS
+        # ========================================================
+
         "heat_pumps": copy.deepcopy(
             _named_case(
                 config,
@@ -442,6 +812,11 @@ def resolve_config(
                 selection["heat_pump_case"],
             )
         ),
+
+        # ========================================================
+        # SWFL UNITS
+        # ========================================================
+
         "swfl_units": copy.deepcopy(
             _named_case(
                 config,
@@ -449,6 +824,11 @@ def resolve_config(
                 selection["swfl_unit_case"],
             )
         ),
+
+        # ========================================================
+        # BIOMETHANE USE
+        # ========================================================
+
         "biomethane_use": copy.deepcopy(
             _named_case(
                 config,
@@ -456,6 +836,11 @@ def resolve_config(
                 selection["biomethane_use_case"],
             )
         ),
+
+        # ========================================================
+        # BIOGAS ROUTES
+        # ========================================================
+
         "biogas_routes": copy.deepcopy(
             _named_case(
                 config,
@@ -463,6 +848,11 @@ def resolve_config(
                 selection["biogas_route_case"],
             )
         ),
+
+        # ========================================================
+        # TECHNICAL PARAMETERS
+        # ========================================================
+
         "technical": copy.deepcopy(
             _require_mapping(
                 config,
@@ -470,6 +860,11 @@ def resolve_config(
                 "configuration",
             )
         ),
+
+        # ========================================================
+        # RUN SETTINGS
+        # ========================================================
+
         "run": copy.deepcopy(
             config.get(
                 "run",
@@ -477,7 +872,6 @@ def resolve_config(
             )
         ),
     }
-
 
 def _mutable_mapping(
     mapping: MutableMapping[str, Any],
@@ -659,16 +1053,76 @@ def _apply_run_settings(
 def apply_network_price_scenario(
     network,
     resolved: Mapping[str, Any],
+    biogas_sh_active: bool = True,
 ) -> None:
     """
-    Apply the selected fossil-gas price to CH4_NG generators and
-    the selected biomethane price to the 21 custom Biogas.SH
-    generators.
+    Apply scenario-dependent fuel and biomethane marginal costs.
 
-    Run after adjust_CH4_gen_carriers() and after custom
-    Biogas.SH assets are added, but before clustering.
+    The function performs two separate price assignments:
+
+    1. Fossil natural gas
+       ------------------
+       The selected CH4_NG marginal cost is assigned to all
+       generators with carrier ``CH4_NG``.
+
+       The final fossil-gas cost already includes:
+
+           gas commodity price
+           + CO2 certificate price * emission factor
+
+    2. Biogas.SH biomethane
+       ---------------------
+       If Biogas.SH is active, the effective biomethane
+       marginal cost is assigned to the 21 custom
+       ``CH4_biogas`` generators.
+
+       The effective biomethane cost may include a revenue
+       credit from selling separated biogenic CO2:
+
+           effective biomethane cost
+           = base biomethane cost
+           - biogenic CO2 revenue credit
+
+    This function should run:
+        - after adjust_CH4_gen_carriers()
+        - after Biogas.SH assets have been added
+        - before spatial clustering
     """
+
+    # ============================================================
+    # RESOLVED SCENARIO DATA
+    # ============================================================
+
     prices = resolved["prices"]
+    selection = resolved["selection"]
+
+    # ============================================================
+    # FOSSIL NATURAL-GAS PRICE
+    # ============================================================
+
+    gas_commodity_price = float(
+        prices[
+            "gas_commodity_price_eur_per_mwh_fuel"
+        ]
+    )
+
+    fossil_co2_price = float(
+        prices[
+            "co2_price_eur_per_tco2"
+        ]
+    )
+
+    fossil_emission_factor = float(
+        prices[
+            "emission_factor_tco2_per_mwh_fuel"
+        ]
+    )
+
+    fossil_co2_cost = float(
+        prices[
+            "co2_cost_on_gas_eur_per_mwh_fuel"
+        ]
+    )
 
     fossil_gas_cost = float(
         prices[
@@ -676,13 +1130,10 @@ def apply_network_price_scenario(
         ]
     )
 
-    biomethane_cost = float(
-        prices[
-            "biomethane_marginal_cost_eur_per_mwh_hs"
-        ]
-    )
+    # ------------------------------------------------------------
+    # Find all fossil CH4_NG generators
+    # ------------------------------------------------------------
 
-    # Original fossil natural-gas generators.
     ch4_ng_ids = network.generators.index[
         network.generators["carrier"]
         .astype(str)
@@ -691,16 +1142,177 @@ def apply_network_price_scenario(
 
     if len(ch4_ng_ids) == 0:
         raise ScenarioConfigError(
-            "No CH4_NG generators found. "
-            "adjust_CH4_gen_carriers() must run first."
+            "No CH4_NG generators were found. "
+            "adjust_CH4_gen_carriers() must run before "
+            "apply_network_price_scenario()."
         )
+
+    # ------------------------------------------------------------
+    # Apply fossil-gas marginal cost
+    # ------------------------------------------------------------
 
     network.generators.loc[
         ch4_ng_ids,
         "marginal_cost",
     ] = fossil_gas_cost
 
-    # Only the custom Biogas.SH biomethane generators.
+    # ============================================================
+    # BASELINE RUN WITHOUT BIOGAS.SH
+    # ============================================================
+
+    if not biogas_sh_active:
+
+        print(
+            "\n"
+            "============================================================"
+        )
+        print(
+            "APPLIED NETWORK PRICE SCENARIO"
+        )
+        print(
+            "============================================================"
+        )
+
+        print(
+            "\nFOSSIL NATURAL GAS"
+        )
+        print(
+            "------------------------------------------------------------"
+        )
+
+        print(
+            "Fossil-gas case:",
+            selection[
+                "fossil_gas_price_case"
+            ],
+        )
+
+        print(
+            "Gas commodity price:",
+            f"{gas_commodity_price:.4f}",
+            "EUR/MWh_fuel",
+        )
+
+        print(
+            "Fossil CO2 price:",
+            f"{fossil_co2_price:.4f}",
+            "EUR/tCO2",
+        )
+
+        print(
+            "Natural-gas emission factor:",
+            f"{fossil_emission_factor:.4f}",
+            "tCO2/MWh_fuel",
+        )
+
+        print(
+            "CO2 cost on natural gas:",
+            f"{fossil_co2_cost:.4f}",
+            "EUR/MWh_fuel",
+        )
+
+        print(
+            "Final CH4_NG marginal cost:",
+            f"{fossil_gas_cost:.4f}",
+            "EUR/MWh_fuel",
+        )
+
+        print(
+            "CH4_NG generators updated:",
+            len(ch4_ng_ids),
+        )
+
+        print(
+            "\nBIOGAS.SH"
+        )
+        print(
+            "------------------------------------------------------------"
+        )
+
+        print(
+            "Biogas.SH inactive: "
+            "biomethane price assignment skipped."
+        )
+
+        print(
+            "============================================================\n"
+        )
+
+        return
+
+    # ============================================================
+    # BIOMETHANE PRICE
+    # ============================================================
+
+    biomethane_base_cost = float(
+        prices[
+            "biomethane_base_cost_eur_per_mwh_hs"
+        ]
+    )
+
+    biomethane_effective_cost = float(
+        prices[
+            "biomethane_marginal_cost_eur_per_mwh_hs"
+        ]
+    )
+
+    # ============================================================
+    # BIOGENIC CO2 SALE ASSUMPTIONS
+    # ============================================================
+
+    co2_sale_active = bool(
+        prices.get(
+            "co2_sale_active",
+            False,
+        )
+    )
+
+    biogenic_co2_sale_price = float(
+        prices.get(
+            "co2_sale_price_eur_per_t",
+            0.0,
+        )
+    )
+
+    biogenic_co2_additional_cost = float(
+        prices.get(
+            "co2_additional_cost_eur_per_t",
+            0.0,
+        )
+    )
+
+    biogenic_co2_net_price = float(
+        prices.get(
+            "co2_net_sale_price_eur_per_t",
+            0.0,
+        )
+    )
+
+    biogenic_co2_yield = float(
+        prices.get(
+            "co2_yield_t_per_mwh_biomethane",
+            0.0,
+        )
+    )
+
+    co2_marketable_fraction = float(
+        prices.get(
+            "co2_marketable_fraction",
+            1.0,
+        )
+    )
+
+    co2_revenue_credit = float(
+        prices.get(
+            "co2_revenue_credit_eur_per_mwh_biomethane",
+            0.0,
+        )
+    )
+
+    # ============================================================
+    # FIND CUSTOM BIOGAS.SH BIOMETHANE GENERATORS
+    # ============================================================
+
     generator_names = (
         network.generators.index
         .to_series()
@@ -712,17 +1324,23 @@ def apply_network_price_scenario(
         .astype(str)
     )
 
-    custom_biomethane_mask = (
+    generator_carriers = (
         network.generators["carrier"]
         .astype(str)
-        .eq("CH4_biogas")
+    )
+
+    custom_biomethane_mask = (
+        generator_carriers.eq(
+            "CH4_biogas"
+        )
     )
 
     custom_biomethane_mask &= (
         generator_names.str.startswith(
             "biogas_sh_ch4_bus_"
         )
-        | generator_buses.str.startswith(
+        |
+        generator_buses.str.startswith(
             "biogas_sh_ch4_bus_"
         )
     )
@@ -733,64 +1351,249 @@ def apply_network_price_scenario(
         ]
     )
 
-    routes = resolved["biogas_routes"]
+    # ------------------------------------------------------------
+    # Validate expected Biogas.SH plant fleet
+    # ------------------------------------------------------------
 
-    biomethane_route_active = bool(
-        routes.get("add_gas_grid_generation", False)
-        or routes.get("add_swfl_direct_supply", False)
-    )
+    expected_biomethane_generators = 21
 
-    expected_biomethane_generators = (
-        21 if biomethane_route_active else 0
-    )
-
-    if len(custom_biomethane_ids) != expected_biomethane_generators:
+    if (
+        len(custom_biomethane_ids)
+        != expected_biomethane_generators
+    ):
         raise ScenarioConfigError(
             "Expected "
-            f"{expected_biomethane_generators} custom Biogas.SH "
-            "biomethane generators for the selected route, "
+            f"{expected_biomethane_generators} "
+            "custom Biogas.SH biomethane generators, "
             f"but found {len(custom_biomethane_ids)}."
         )
+
+    # ============================================================
+    # APPLY EFFECTIVE BIOMETHANE PRICE
+    # ============================================================
 
     network.generators.loc[
         custom_biomethane_ids,
         "marginal_cost",
-    ] = biomethane_cost
+    ] = biomethane_effective_cost
 
-    print("\n=== APPLIED FUEL PRICES ===")
+    # ============================================================
+    # FINAL VERIFICATION
+    # ============================================================
+
+    assigned_biomethane_costs = (
+        network.generators.loc[
+            custom_biomethane_ids,
+            "marginal_cost",
+        ]
+        .astype(float)
+    )
+
+    if not (
+        assigned_biomethane_costs
+        .sub(
+            biomethane_effective_cost
+        )
+        .abs()
+        .le(1e-9)
+        .all()
+    ):
+        raise ScenarioConfigError(
+            "Biomethane marginal-cost assignment failed. "
+            "Not all custom CH4_biogas generators received "
+            "the expected effective biomethane cost."
+        )
+
+    # ============================================================
+    # REPORT APPLIED PRICES
+    # ============================================================
+
+    print(
+        "\n"
+        "============================================================"
+    )
+    print(
+        "APPLIED NETWORK PRICE SCENARIO"
+    )
+    print(
+        "============================================================"
+    )
+
+    # ------------------------------------------------------------
+    # Fossil natural gas
+    # ------------------------------------------------------------
+
+    print(
+        "\nFOSSIL NATURAL GAS"
+    )
+    print(
+        "------------------------------------------------------------"
+    )
+
     print(
         "Fossil-gas case:",
-        resolved["selection"]["fossil_gas_price_case"],
+        selection[
+            "fossil_gas_price_case"
+        ],
     )
+
     print(
-        "Gas commodity:",
-        f"{prices['gas_commodity_price_eur_per_mwh_fuel']:.4f}",
+        "Gas commodity price:",
+        f"{gas_commodity_price:.4f}",
         "EUR/MWh_fuel",
     )
+
     print(
-        "CO2 price:",
-        f"{prices['co2_price_eur_per_tco2']:.4f}",
+        "Fossil CO2 price:",
+        f"{fossil_co2_price:.4f}",
         "EUR/tCO2",
     )
+
     print(
-        "CO2 cost on gas:",
-        f"{prices['co2_cost_on_gas_eur_per_mwh_fuel']:.4f}",
+        "Natural-gas emission factor:",
+        f"{fossil_emission_factor:.4f}",
+        "tCO2/MWh_fuel",
+    )
+
+    print(
+        "CO2 cost on natural gas:",
+        f"{fossil_co2_cost:.4f}",
         "EUR/MWh_fuel",
     )
+
     print(
-        "Final CH4_NG cost:",
+        "Final CH4_NG marginal cost:",
         f"{fossil_gas_cost:.4f}",
         "EUR/MWh_fuel",
     )
+
     print(
         "CH4_NG generators updated:",
         len(ch4_ng_ids),
     )
+
+    # ------------------------------------------------------------
+    # Biomethane
+    # ------------------------------------------------------------
+
+    print(
+        "\nBIOGAS.SH BIOMETHANE"
+    )
+    print(
+        "------------------------------------------------------------"
+    )
+
+    print(
+        "Biomethane price case:",
+        selection[
+            "biomethane_price_case"
+        ],
+    )
+
+    print(
+        "Base biomethane cost:",
+        f"{biomethane_base_cost:.4f}",
+        "EUR/MWh_Hs",
+    )
+
+    # ------------------------------------------------------------
+    # Biogenic CO2 sale
+    # ------------------------------------------------------------
+
+    print(
+        "\nBIOGENIC CO2 SALE"
+    )
+    print(
+        "------------------------------------------------------------"
+    )
+
+    print(
+        "CO2 sale case:",
+        selection[
+            "co2_sale_case"
+        ],
+    )
+
+    print(
+        "CO2 sale active:",
+        "yes"
+        if co2_sale_active
+        else "no",
+    )
+
+    print(
+        "Biogenic CO2 sale price:",
+        f"{biogenic_co2_sale_price:.4f}",
+        "EUR/tCO2",
+    )
+
+    print(
+        "Additional CO2 handling cost:",
+        f"{biogenic_co2_additional_cost:.4f}",
+        "EUR/tCO2",
+    )
+
+    print(
+        "Net biogenic CO2 sale price:",
+        f"{biogenic_co2_net_price:.4f}",
+        "EUR/tCO2",
+    )
+
+    print(
+        "Biogenic CO2 yield:",
+        f"{biogenic_co2_yield:.5f}",
+        "tCO2/MWh_Hs biomethane",
+    )
+
+    print(
+        "Marketable CO2 fraction:",
+        f"{100.0 * co2_marketable_fraction:.1f}",
+        "%",
+    )
+
+    print(
+        "CO2 revenue credit:",
+        f"{co2_revenue_credit:.4f}",
+        "EUR/MWh_Hs biomethane",
+    )
+
+    # ------------------------------------------------------------
+    # Final biomethane price
+    # ------------------------------------------------------------
+
+    print(
+        "\nFINAL BIOMETHANE COST"
+    )
+    print(
+        "------------------------------------------------------------"
+    )
+
+    print(
+        "Base biomethane cost:",
+        f"{biomethane_base_cost:.4f}",
+        "EUR/MWh_Hs",
+    )
+
+    print(
+        "Minus CO2 revenue credit:",
+        f"{co2_revenue_credit:.4f}",
+        "EUR/MWh_Hs",
+    )
+
+    print(
+        "Effective biomethane marginal cost:",
+        f"{biomethane_effective_cost:.4f}",
+        "EUR/MWh_Hs",
+    )
+
     print(
         "Custom biomethane generators updated:",
         len(custom_biomethane_ids),
     )
-    print("===========================")
+
+    print(
+        "============================================================\n"
+    )
 
 
 def apply_config_to_args(
@@ -813,6 +1616,7 @@ def apply_config_to_args(
         args["extra_functionality"] = extra_functionality
 
     prices = resolved["prices"]
+    support = resolved["support"]
     units = resolved["swfl_units"]
     heat_pump_case = resolved["heat_pumps"]
     biomethane_use = resolved["biomethane_use"]
@@ -828,7 +1632,13 @@ def apply_config_to_args(
             "swfl_import_adder_eur_per_mwh_fuel"
         ]
     )
+    biogas["raw_biogas_cost_eur_per_mwh_hs"] = float(
+        prices["raw_biogas_cost_eur_per_mwh_hs"]
+    )
     biogas["biomethane_price_override_eur_per_mwh"] = float(
+        prices["biomethane_marginal_cost_eur_per_mwh_hs"]
+    )
+    biogas["default_biomethane_cost"] = float(
         prices["biomethane_marginal_cost_eur_per_mwh_hs"]
     )
     biogas["electricity_marginal_cost"] = float(
@@ -838,8 +1648,68 @@ def apply_config_to_args(
         prices["onsite_heat_marginal_cost_eur_per_mwh"]
     )
 
-    # Biogas.SH routes.
-    biogas["scenario_mode"] = "custom"
+    # Biogas.SH support regime.
+    support_args = biogas.get("support")
+    if not isinstance(support_args, MutableMapping):
+        support_args = {}
+        biogas["support"] = support_args
+
+    support_args["case"] = str(support["case"])
+    support_args["eeg_active"] = bool(
+        support.get("eeg_active", False)
+    )
+    support_args["market_electricity_marginal_cost"] = float(
+        prices["onsite_electricity_marginal_cost_eur_per_mwh"]
+    )
+    support_args["supported_electricity_marginal_cost"] = float(
+        prices[
+            "onsite_supported_electricity_marginal_cost_eur_per_mwh"
+        ]
+    )
+    support_args["supported_hours_per_year"] = float(
+        support.get("supported_hours_per_year", 0.0)
+    )
+    support_args["flexibility_active"] = bool(
+        support.get("flexibility_active", False)
+    )
+    support_args["chp_capacity_multiplier"] = float(
+        support.get("chp_capacity_multiplier", 1.0)
+    )
+    support_args["flex_capex_eur_per_kw"] = float(
+        support.get("flex_capex_eur_per_kw", 800.0)
+    )
+    support_args["flex_lifetime_years"] = float(
+        support.get("flex_lifetime_years", 15.0)
+    )
+    support_args["flex_discount_rate"] = float(
+        support.get("flex_discount_rate", 0.05)
+    )
+    support_args["flex_fixed_om_fraction"] = float(
+        support.get("flex_fixed_om_fraction", 0.02)
+    )
+    support_args["flexibility_payment_eur_per_kw_year"] = float(
+        support.get("flexibility_payment_eur_per_kw_year", 0.0)
+    )
+
+    # Activate the corresponding extra constraint only when EEG support is on.
+    if support_args["eeg_active"]:
+        extra_functionality["biogas_sh_support"] = {
+            "active": True,
+            "supported_hours_per_year": support_args[
+                "supported_hours_per_year"
+            ],
+            "ignore_missing_components": False,
+        }
+    else:
+        extra_functionality.pop("biogas_sh_support", None)
+
+    # Biogas.SH routes. Final production scenarios use the hybrid topology.
+    if resolved["selection"]["biogas_route_case"] == "hybrid":
+        biogas["scenario_mode"] = "hybrid"
+    else:
+        # Legacy route cases remain available for diagnostic/debug runs.
+        biogas["scenario_mode"] = "custom"
+
     for key in (
         "add_local_generation",
         "add_gas_grid_generation",
@@ -1089,6 +1959,7 @@ def scenario_summary(
 
     selection = resolved["selection"]
     prices = resolved["prices"]
+    support = resolved["support"]
     heat_pumps = resolved["heat_pumps"]
     units = resolved["swfl_units"]
     biomethane_use = resolved["biomethane_use"]
@@ -1156,6 +2027,34 @@ def scenario_summary(
         f"Scenario name:                  {resolved['scenario_name']}",
         f"Configuration version:          {resolved['config_version']}",
         "",
+        "BIOGAS.SH SUPPORT REGIME",
+        "------------------------------------------------------------",
+        (
+            "Support case:                   "
+            f"{selection['support_case']}"
+        ),
+        (
+            "EEG support active:             "
+            f"{yes_no(support.get('eeg_active', False))}"
+        ),
+        (
+            "Supported hours per year:       "
+            f"{float(support.get('supported_hours_per_year', 0.0)):.1f}"
+        ),
+        (
+            "CHP capacity multiplier:        "
+            f"{float(support.get('chp_capacity_multiplier', 1.0)):.2f}"
+        ),
+        (
+            "Flexibilisation active:         "
+            f"{yes_no(support.get('flexibility_active', False))}"
+        ),
+        (
+            "Flexibility payment:            "
+            f"{float(support.get('flexibility_payment_eur_per_kw_year', 0.0)):.2f} "
+            "EUR/kW_el/a"
+        ),
+        "",
         "FOSSIL NATURAL-GAS PRICE",
         "------------------------------------------------------------",
         (
@@ -1203,13 +2102,28 @@ def scenario_summary(
             f"{selection['biomethane_price_case']}"
         ),
         (
+            "Raw biogas cost:                "
+            f"{prices['raw_biogas_cost_eur_per_mwh_hs']:.4f} "
+            "EUR/MWh_Hs"
+        ),
+        (
             "Biomethane marginal cost:       "
             f"{prices['biomethane_marginal_cost_eur_per_mwh_hs']:.4f} "
             "EUR/MWh_Hs"
         ),
         (
-            "Onsite electricity cost:        "
+            "Merchant onsite electricity:    "
             f"{prices['onsite_electricity_marginal_cost_eur_per_mwh']:.4f} "
+            "EUR/MWh_el"
+        ),
+        (
+            "Supported onsite electricity:   "
+            f"{prices['onsite_supported_electricity_marginal_cost_eur_per_mwh']:.4f} "
+            "EUR/MWh_el"
+        ),
+        (
+            "EEG premium assumption:         "
+            f"{prices['eeg_premium_eur_per_mwh']:.4f} "
             "EUR/MWh_el"
         ),
         (
@@ -1338,6 +2252,11 @@ def scenario_summary(
                 "The SWFL boiler and gas-to-power Links therefore "
                 "do not repeat these costs."
             ),
+            (
+                "Biomethane full cost is assigned upstream to the custom "
+                "CH4_biogas generators; storage and route links do not "
+                "repeat this infrastructure cost."
+            ),
             "============================================================",
         ]
     )
@@ -1388,6 +2307,7 @@ def expand_scenario_matrix(
         record["scenario_name"] = "__".join(
             selection[key]
             for key in (
+                    "support_case",
                     "fossil_gas_price_case",
                     "biomethane_price_case",
                     "heat_pump_case",

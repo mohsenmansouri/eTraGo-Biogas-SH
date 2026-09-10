@@ -811,6 +811,254 @@ def kmedoids_dijkstra_clustering(
     return busmap, medoid_idx
 
 
+def get_focus_protected_buses(
+    etrago,
+    network,
+    focus_region,
+    per_country=True,
+    include_border=True,
+):
+    """
+    Return AC buses which must be protected from spatial clustering.
+
+    Protected buses consist of:
+
+      1. all AC buses geometrically located inside focus_region
+      2. optionally, the first-ring AC buses immediately outside the
+         focus-region boundary
+
+    The purpose is to preserve the original nodal topology inside the
+    study region without forcing extreme clustering weights.
+    """
+
+    # ---------------------------------------------------------------------
+    # Load focus-region geometry
+    # ---------------------------------------------------------------------
+
+    if isinstance(focus_region, list):
+
+        if "oep.iks.cs.ovgu.de" in str(etrago.engine.url):
+
+            saio.register_schema(
+                "tables",
+                etrago.engine,
+            )
+
+            from saio.tables import edut_00_012 as vg250_krs
+
+        else:
+
+            saio.register_schema(
+                "boundaries",
+                etrago.engine,
+            )
+
+            from saio.boundaries import vg250_krs
+
+
+        query = etrago.session.query(
+            vg250_krs
+        )
+
+        krs = saio.as_pandas(
+            query,
+            geometry="geometry",
+        )
+
+
+        missing = (
+            set(focus_region)
+            - set(krs["gen"])
+        )
+
+
+        if missing:
+
+            raise ValueError(
+                "Invalid focus_region entries: "
+                f"{missing}"
+            )
+
+
+        focus_gdf = krs[
+            krs["gen"].isin(
+                focus_region
+            )
+        ]
+
+
+    else:
+
+        focus_gdf = gpd.read_file(
+            focus_region
+        )
+
+
+    # ---------------------------------------------------------------------
+    # Create AC-bus GeoDataFrame
+    # ---------------------------------------------------------------------
+
+    ac_buses = network.buses[
+        network.buses.carrier == "AC"
+    ].copy()
+
+
+    buses_df = ac_buses[
+        [
+            "x",
+            "y",
+        ]
+    ].copy()
+
+
+    buses_df["geometry"] = buses_df.apply(
+        lambda row:
+            Point(
+                row["x"],
+                row["y"],
+            ),
+        axis=1,
+    )
+
+
+    buses_gdf = gpd.GeoDataFrame(
+        buses_df,
+        geometry="geometry",
+        crs=4326,
+    )
+
+
+    buses_gdf = buses_gdf.to_crs(
+        epsg=25832
+    )
+
+
+    if focus_gdf.crs is None:
+
+        raise ValueError(
+            "CRS of focus region is missing."
+        )
+
+
+    focus_gdf = focus_gdf.to_crs(
+        buses_gdf.crs
+    )
+
+
+    focus_polygon = (
+        focus_gdf.geometry.unary_union
+    )
+
+
+    # ---------------------------------------------------------------------
+    # AC buses inside study region
+    # ---------------------------------------------------------------------
+
+    inside_mask = (
+        buses_gdf.geometry.within(
+            focus_polygon
+        )
+    )
+
+
+    inside = pd.Index(
+        buses_gdf.index[
+            inside_mask
+        ].astype(str)
+    )
+
+
+    # ---------------------------------------------------------------------
+    # First-ring buses outside study region
+    # ---------------------------------------------------------------------
+
+    border = pd.Index(
+        [],
+        dtype=str,
+    )
+
+
+    if include_border:
+
+        lines = network.lines.copy()
+
+
+        lines_cross = lines[
+            (
+                lines.bus0
+                .astype(str)
+                .isin(inside)
+            )
+            ^
+            (
+                lines.bus1
+                .astype(str)
+                .isin(inside)
+            )
+        ]
+
+
+        if (
+            per_country
+            and "country"
+            in lines_cross.columns
+        ):
+
+            lines_cross = lines_cross[
+                lines_cross.country == "DE"
+            ]
+
+
+        border_set = (
+
+            set(
+                lines_cross.bus0
+                .astype(str)
+            )
+
+            |
+
+            set(
+                lines_cross.bus1
+                .astype(str)
+            )
+
+        ) - set(
+            inside
+        )
+
+
+        border = pd.Index(
+            sorted(
+                border_set
+            ),
+            dtype=str,
+        )
+
+
+    protected = inside.union(
+        border
+    )
+
+
+    logger.info(
+        "\n"
+        "PROTECTED FOCUS NETWORK\n"
+        "--------------------------------------------\n"
+        f"focus regions:        {focus_region}\n"
+        f"focus AC buses:       {len(inside)}\n"
+        f"boundary AC buses:    {len(border)}\n"
+        f"protected AC buses:   {len(protected)}\n"
+    )
+
+
+    return (
+        protected,
+        inside,
+        border,
+    )
+
+
 def focus_weighting(
     etrago,
     network,
