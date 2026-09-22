@@ -129,7 +129,7 @@ selection:
   #
   biomethane_price_case: "project_92_9"
 
-  co2_sale_case: "medium_76_5"
+  co2_sale_case: "medium_60"
 
 
   # ---------------------------------------------------------------------------
@@ -423,11 +423,11 @@ co2_sale_cases:
     marketable_fraction: 1.0
     co2_yield_t_per_mwh_biomethane: 0.12365
 
-  medium_76_5:
+  medium_60:
     description: >
-      CO2 valorisation sensitivity at 76.5 EUR/tCO2.
+      CO2 valorisation sensitivity at 60 EUR/tCO2.
     active: true
-    sale_price_eur_per_t: 76.5
+    sale_price_eur_per_t: 60.0
     additional_cost_eur_per_t: 0.0
     marketable_fraction: 1.0
     co2_yield_t_per_mwh_biomethane: 0.12365
@@ -1185,7 +1185,7 @@ scenario_matrix:
 
     # Fixed CO2-sale assumption for this matrix.
     co2_sale_case:
-      - "medium_76_5"
+      - "medium_60"
 
 
     # Fixed heat-pump configuration.
