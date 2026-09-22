@@ -229,15 +229,40 @@ def apply_swfl_real_system(
         True,
     )
 
+    ac_source = str(
+        ac_cfg.get(
+            "profile_source",
+            "egon_scaled",
+        )
+    ).strip().lower()
+
     ac_shape = None
+    ac_profile = None
 
     if ac_active:
 
-        ac_shape = build_existing_ac_profile_shape(
-            network=network,
-            area_buses=area_buses,
-            cfg=ac_cfg,
-        )
+        if ac_source == "swfl_measured":
+
+            ac_profile = read_swfl_electricity_profile_for_snapshots(
+                network=network,
+                snapshots=snapshots,
+                cfg=ac_cfg,
+            )
+
+        elif ac_source == "egon_scaled":
+
+            # This must happen before the generic SWFL loads are removed.
+            ac_shape = build_existing_ac_profile_shape(
+                network=network,
+                area_buses=area_buses,
+                cfg=ac_cfg,
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported ac_load.profile_source "
+                f"{ac_source!r}. Use 'swfl_measured' or 'egon_scaled'."
+            )
 
 
     # ==================================================================
@@ -404,18 +429,26 @@ def apply_swfl_real_system(
 
     if ac_active:
 
-        if ac_shape is None:
-            raise ValueError(
-                "SWFL AC-load configuration is active, "
-                "but no existing eGon AC profile shape was created."
+        if ac_source == "egon_scaled":
+
+            if ac_shape is None:
+                raise ValueError(
+                    "SWFL AC-load configuration is active, "
+                    "but no existing eGon AC profile shape was created."
+                )
+
+            ac_profile = scale_ac_profile_to_target(
+                profile=ac_shape,
+                network=network,
+                cfg=ac_cfg,
+                snapshots=snapshots,
             )
 
-        ac_profile = scale_ac_profile_to_target(
-            profile=ac_shape,
-            network=network,
-            cfg=ac_cfg,
-            snapshots=snapshots,
-        )
+        if ac_profile is None:
+            raise ValueError(
+                "SWFL AC-load configuration is active, "
+                "but no AC profile was created."
+            )
 
         add_or_replace_load(
             network=network,
@@ -684,6 +717,8 @@ def apply_swfl_real_system(
         area_buses=area_buses,
         heat_profile=heat_profile,
         ac_shape=ac_shape,
+        ac_profile=ac_profile,
+        ac_source=ac_source,
     )
 
     return network
@@ -1528,6 +1563,228 @@ def scale_ac_profile_to_target(profile, network, cfg, snapshots=None):
     )
 
     return scaled
+
+
+def read_swfl_electricity_profile_for_snapshots(
+    network,
+    snapshots: pd.Index,
+    cfg: Dict[str, Any],
+) -> pd.Series:
+    """
+    Read the SWFL quarter-hourly load profile and map it to model snapshots.
+
+    The published SWFL workbook uses interval-ending timestamps. For example,
+    00:15 represents the interval 00:00--00:15. Four consecutive measured
+    quarter-hours are therefore averaged to one hourly MW value. Sequential
+    grouping also handles the workbook's daylight-saving timestamp jumps while
+    preserving all 35,040 measured intervals.
+
+    Only ``Mittelspannung (MS)`` is used for the aggregate SWFL load. The NS
+    and MS/NS series are downstream network levels and must not be added to it.
+    """
+
+    path_value = cfg.get("xlsx_path") or cfg.get("csv_path")
+    if not path_value:
+        raise ValueError(
+            "ac_load.profile_source='swfl_measured' requires "
+            "ac_load.xlsx_path or ac_load.csv_path."
+        )
+
+    path = Path(path_value)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    header = int(cfg.get("header", 0))
+    usecols = cfg.get("usecols", None)
+
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(
+            path,
+            sheet_name=cfg.get("sheet_name", 0),
+            header=header,
+            usecols=usecols,
+        )
+    else:
+        df = read_table_flexible(
+            path,
+            header=header,
+            encoding=cfg.get("encoding", None),
+        )
+
+    df = normalise_columns(df)
+
+    datetime_column = find_column(
+        df,
+        str(cfg.get("datetime_column", "Datum/Uhrzeit")),
+    )
+    power_column = find_column(
+        df,
+        str(cfg.get("power_column", "Mittelspannung (MS)")),
+    )
+
+    datetime_format = cfg.get("datetime_format", "mixed")
+    try:
+        dt = pd.to_datetime(
+            df[datetime_column],
+            errors="coerce",
+            format=datetime_format,
+            dayfirst=True,
+        )
+    except (TypeError, ValueError):
+        # Compatibility fallback for older pandas versions without
+        # format="mixed" support.
+        dt = pd.to_datetime(
+            df[datetime_column],
+            errors="coerce",
+            dayfirst=True,
+        )
+
+    nonempty_datetimes = df[datetime_column].notna().sum()
+    if dt.notna().sum() < 0.9 * nonempty_datetimes:
+        # Last-resort mixed-format fallback. Per-value parsing is slower but
+        # avoids losing ISO timestamps when dayfirst=True is used globally.
+        dt = df[datetime_column].map(
+            lambda value: pd.to_datetime(
+                value,
+                errors="coerce",
+                dayfirst=True,
+            )
+        )
+
+    raw_values = df[power_column]
+    values = pd.to_numeric(raw_values, errors="coerce")
+
+    # Fallback for CSV/text exports with German decimal formatting.
+    if values.notna().sum() < 0.9 * raw_values.notna().sum():
+        text_values = (
+            raw_values.astype(str)
+            .str.strip()
+            .str.replace("\u00a0", "", regex=False)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
+        )
+        values = pd.to_numeric(text_values, errors="coerce")
+
+    interval_minutes = int(cfg.get("interval_minutes", 15))
+    if interval_minutes <= 0:
+        raise ValueError("ac_load.interval_minutes must be greater than zero.")
+    if 60 % interval_minutes != 0:
+        raise ValueError(
+            "ac_load.interval_minutes must divide 60 exactly."
+        )
+
+    year = int(cfg.get("year"))
+    year_start = pd.Timestamp(year=year, month=1, day=1)
+    next_year_start = pd.Timestamp(year=year + 1, month=1, day=1)
+
+    interval_end = _as_bool(
+        cfg.get("timestamps_are_interval_end", True),
+        True,
+    )
+
+    valid = dt.notna() & values.notna()
+    if interval_end:
+        # The first value is 00:15 and the last is 00:00 of the next year.
+        in_year = (dt > year_start) & (dt <= next_year_start)
+    else:
+        in_year = (dt >= year_start) & (dt < next_year_start)
+
+    selected_values = values.loc[valid & in_year].to_numpy(dtype=float)
+
+    if selected_values.size == 0:
+        raise ValueError(
+            f"No valid {year} values found in SWFL column {power_column!r}."
+        )
+
+    unit = str(cfg.get("unit", "kW")).strip().lower()
+    if unit in {"kw", "kwh/h"}:
+        selected_values = selected_values / 1000.0
+    elif unit not in {"mw", "mwh/h"}:
+        raise ValueError(
+            f"Unsupported ac_load.unit {unit!r}; use 'kW' or 'MW'."
+        )
+
+    expected_hours = int(
+        (next_year_start - year_start) / pd.Timedelta(hours=1)
+    )
+    if expected_hours != 8760:
+        raise ValueError(
+            "The SWFL reader currently requires a non-leap source year "
+            f"with 8760 hours; {year} has {expected_hours}."
+        )
+
+    values_per_hour = 60 // interval_minutes
+    expected_values = expected_hours * values_per_hour
+    if len(selected_values) != expected_values:
+        raise ValueError(
+            f"Expected {expected_values} {interval_minutes}-minute values "
+            f"for {year}, found {len(selected_values)}. Check header, year, "
+            "timestamp convention, and missing rows."
+        )
+
+    # The SWFL workbook contains daylight-saving clock jumps and duplicate
+    # local timestamps but still exactly 35,040 chronological quarter-hours.
+    # Grouping every four consecutive rows preserves every measured interval
+    # and produces the 8,760-hour series required by eTraGo.
+    hourly_values = selected_values.reshape(
+        expected_hours,
+        values_per_hour,
+    ).mean(axis=1)
+
+    hourly = pd.Series(
+        hourly_values,
+        index=pd.date_range(
+            year_start,
+            periods=expected_hours,
+            freq="h",
+        ),
+        name="swfl_ac_mw",
+        dtype=float,
+    )
+
+    if _as_bool(cfg.get("clip_negative", True), True):
+        hourly = hourly.clip(lower=0.0)
+
+    raw_annual_energy = float(
+        selected_values.sum() * interval_minutes / 60.0
+    )
+
+    # Scale the complete annual profile before selecting model snapshots. This
+    # preserves the measured winter/summer levels in short test runs.
+    target = cfg.get("target_annual_demand_mwh", None)
+    scale_factor = 1.0
+    if target is not None:
+        target = float(target)
+        if raw_annual_energy <= 0:
+            raise ValueError(
+                "Measured SWFL electricity profile has zero annual energy."
+            )
+        scale_factor = target / raw_annual_energy
+        hourly = hourly * scale_factor
+
+    mapped = map_year_profile_to_network_snapshots(
+        profile_8760=hourly,
+        snapshots=snapshots,
+    )
+
+    weights = snapshot_weights(network, snapshots).reindex(snapshots).fillna(1.0)
+    represented_energy = float((mapped * weights).sum())
+
+    print(
+        "\nSWFL measured AC load"
+        f"\n  file:                         {path}"
+        f"\n  source column:                {power_column}"
+        f"\n  source year:                  {year}"
+        f"\n  raw annual energy:            {raw_annual_energy:.3f} MWh"
+        f"\n  annual scaling factor:        {scale_factor:.9f}"
+        f"\n  final annual profile energy:  {float(hourly.sum()):.3f} MWh"
+        f"\n  source intervals:             {len(selected_values)}"
+        f"\n  mapped weighted energy:       {represented_energy:.3f} MWh"
+        f"\n  mapped mean load:             {float(mapped.mean()):.3f} MW"
+        f"\n  mapped peak load:             {float(mapped.max()):.3f} MW"
+    )
+
+    return mapped.astype(float)
 
 
 def read_heat_profile_for_snapshots(snapshots: pd.Index, cfg: Dict[str, Any]) -> pd.Series:
@@ -3217,12 +3474,22 @@ def validate_swfl_heat_pumps(
 # =============================================================================
 
 
-def read_table_flexible(path: Path) -> pd.DataFrame:
+def read_table_flexible(
+    path: Path,
+    header: int = 0,
+    encoding: Optional[str] = None,
+) -> pd.DataFrame:
+
     path = Path(path)
+
     if not path.exists():
         raise FileNotFoundError(path)
+
     if path.suffix.lower() in {".xlsx", ".xls"}:
-        return pd.read_excel(path)
+        return pd.read_excel(
+            path,
+            header=header,
+        )
 
     attempts = [
         {"sep": None, "engine": "python"},
@@ -3233,15 +3500,36 @@ def read_table_flexible(path: Path) -> pd.DataFrame:
         {"sep": "\t", "decimal": ","},
         {"sep": "\t", "decimal": "."},
     ]
+
+    encodings = (
+        [str(encoding)]
+        if encoding
+        else ["utf-8-sig", "cp1252", "latin1"]
+    )
+
     last_error = None
-    for kwargs in attempts:
-        try:
-            df = pd.read_csv(path, **kwargs)
-            if df.shape[1] >= 2:
-                return df
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError(f"Could not read {path}: {last_error}")
+
+    for current_encoding in encodings:
+
+        for kwargs in attempts:
+
+            try:
+                df = pd.read_csv(
+                    path,
+                    header=header,
+                    encoding=current_encoding,
+                    **kwargs,
+                )
+
+                if df.shape[1] >= 2:
+                    return df
+
+            except Exception as exc:
+                last_error = exc
+
+    raise RuntimeError(
+        f"Could not read {path}: {last_error}"
+    )
 
 
 def normalise_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -3374,6 +3662,8 @@ def print_swfl_real_system_summary(
     area_buses: Set[str],
     heat_profile: Optional[pd.Series],
     ac_shape: Optional[pd.Series],
+    ac_profile: Optional[pd.Series],
+    ac_source: str,
 ) -> None:
     hp_cfg = settings.get("future_heat_pumps", {}) or {}
     active_hps = []
@@ -3398,6 +3688,10 @@ def print_swfl_real_system_summary(
         print(f"  heat load mean MW:        {float(heat_profile.mean()):.3f}")
     if ac_shape is not None:
         print(f"  AC source profile points: {len(ac_shape)}")
+    if ac_profile is not None:
+        print(f"  AC profile source:        {ac_source}")
+        print(f"  AC load max MW:           {float(ac_profile.max()):.3f}")
+        print(f"  AC load mean MW:          {float(ac_profile.mean()):.3f}")
     print(f"  future heat pumps active: {active_hps if active_hps else 'none'}")
 
 

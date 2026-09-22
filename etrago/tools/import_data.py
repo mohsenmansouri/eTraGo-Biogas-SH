@@ -66,6 +66,7 @@ class EtragoInputPaths:
     # SWFL files
     SWFL_DIR: Path
     SWFL_HEAT_CSV: Path
+    SWFL_ELECTRICITY_LOAD_CSV: Path
 
     # Output/debug
     OUTPUT_DIR: Path
@@ -145,6 +146,11 @@ def get_data_paths(validate: bool = False) -> EtragoInputPaths:
         swfl_dir / "stadtwerke_flensburg_hourly_heat.csv",
     )
 
+    swfl_electricity_load_csv = env_path(
+        "SWFL_ELECTRICITY_LOAD_CSV",
+        swfl_dir / "2022_LG_Jahreshoechstlast_netto.csv",
+    )
+
     # ------------------------------------------------------------------
     # Output/debug
     # ------------------------------------------------------------------
@@ -170,6 +176,7 @@ def get_data_paths(validate: bool = False) -> EtragoInputPaths:
         BIOGAS_SH_FOCUS_REGION=biogas_sh_focus_region,
         SWFL_DIR=swfl_dir,
         SWFL_HEAT_CSV=swfl_heat_csv,
+        SWFL_ELECTRICITY_LOAD_CSV=swfl_electricity_load_csv,
         OUTPUT_DIR=output_dir,
         DEBUG_LOG_PATH=debug_log_path,
     )

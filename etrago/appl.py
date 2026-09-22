@@ -120,12 +120,26 @@ BIOGAS_SH_FOCUS_REGION = DATA_PATHS.BIOGAS_SH_FOCUS_REGION
 
 SWFL_DIR = DATA_PATHS.SWFL_DIR
 SWFL_HEAT_CSV = DATA_PATHS.SWFL_HEAT_CSV
+SWFL_ELECTRICITY_LOAD_CSV = (
+    DATA_PATHS.SWFL_ELECTRICITY_LOAD_CSV
+)
+
+# ---------------------------------------------------------------------------
+# SWFL electricity-load configuration
+# ---------------------------------------------------------------------------
+
+# "swfl_measured" = measured 2022 quarter-hourly profile
+# "egon_scaled"   = existing eGon profile scaled to measured annual demand
+SWFL_AC_PROFILE_SOURCE = "egon_scaled"
+
+# Annual energy of Mittelspannung (MS) in the 2022 SWFL file.
+SWFL_ANNUAL_DEMAND_MWH = 381_347.289
 
 DEBUG_LOG_PATH = DATA_PATHS.DEBUG_LOG_PATH
 
 args = {
     # Setup and Configuration:
-    "db": "local_egon2035",  # database session: oep or local database
+    "db": "oep",  # database session: oep or local database (local_egon2035)
     "gridversion": None,  # None for model_draft or version number
 
     "method": {  # choose method and settings for optimization
@@ -426,30 +440,51 @@ args = {
         },
 
         # ------------------------------------------------------------------
-        # Real-scaled Flensburg/SWFL AC load
+        # Flensburg/SWFL AC load
         # ------------------------------------------------------------------
-        # Temporal shape comes from existing eGon AC loads in the selected
-        # MV grid districts. Annual energy is scaled to real electricity demand.
+        # Both alternatives represent the same annual electricity demand.
+        # Only the temporal profile shape changes.
         "ac_load": {
             "active": True,
+
+            # Choose "swfl_measured" or "egon_scaled".
+            "profile_source": SWFL_AC_PROFILE_SOURCE,
+
+            # --------------------------------------------------------------
+            # Settings used by swfl_measured
+            # --------------------------------------------------------------
+            "csv_path": str(SWFL_ELECTRICITY_LOAD_CSV),
+            "encoding": "cp1252",
+
+            # Datum/Uhrzeit is on CSV line 8.
+            "header": 7,
+            "year": 2022,
+            "datetime_column": "Datum/Uhrzeit",
+            "datetime_format": "mixed",
+
+            # Aggregate SWFL demand; do not add NS and MS/NS.
+            "power_column": "Mittelspannung (MS)",
+            "unit": "MW",
+            "interval_minutes": 15,
+            "timestamps_are_interval_end": True,
+
+            # --------------------------------------------------------------
+            # Settings used by egon_scaled
+            # --------------------------------------------------------------
+            "source_carrier": "AC",
             "target_is_annual": True,
             "scale_annual_target_to_snapshot_hours": True,
 
-            "use_existing_egon_profile_shape": True,
+            # Used directly for eGon scaling. For the measured profile this
+            # produces a scaling factor of approximately 1.0.
+            "target_annual_demand_mwh": SWFL_ANNUAL_DEMAND_MWH,
 
-            # Stadtwerke / Flensburg real annual electricity demand:
-            # 381.516 GWh/a = 381,516 MWh/a
-            "target_annual_demand_mwh": 381516.0,
-
+            # --------------------------------------------------------------
+            # Common settings
+            # --------------------------------------------------------------
             "carrier": "AC",
-            "source_carrier": "AC",
-
             "name": "swfl_real_ac_load",
-
             "clip_negative": True,
-
-            # Optional fallback if automatic MV-district selection misses loads:
-            # "source_load_ids": ["load_id_1", "load_id_2"],
         },
 
         # ------------------------------------------------------------------
